@@ -138,8 +138,22 @@ final class KeroTerminalView: AppTerminalView, TerminalBackendSurface {
             isCapturingHistoryExport = false
             capturedHistoryExportPath = nil
         }
-        guard performBindingAction(action) else { return nil }
-        return capturedHistoryExportPath
+        // Bracket the export: Ghostty's write_*_file actions leak two
+        // directory descriptors per call inside the prebuilt binary, which
+        // exhausts the descriptor table after hours of agent monitoring and
+        // leaves every new pane shell-less - see TerminalExportDescriptorLeak.
+        let descriptorsBefore = TerminalExportDescriptorLeak.openDescriptors()
+        guard performBindingAction(action) else {
+            TerminalExportDescriptorLeak.reclaim(
+                appearedSince: descriptorsBefore, exportedFilePath: nil
+            )
+            return nil
+        }
+        let path = capturedHistoryExportPath
+        TerminalExportDescriptorLeak.reclaim(
+            appearedSince: descriptorsBefore, exportedFilePath: path
+        )
+        return path
     }
 
     func consumeHistoryExportURL(_ url: String, kind: TerminalOpenURLKind) -> Bool {

@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Fix new terminal panes failing to start a shell after hours of coding-agent use: the Ghostty backend's screen exports leaked two file descriptors each, exhausting the process descriptor table
+
 ## [0.1.45]
 
 - Automate project-scoped panes and coding agents from Kero terminals with guarded `+pane` and `+agent` commands, one-click AI setup, semantic status badges, completion notifications, and attention navigation
