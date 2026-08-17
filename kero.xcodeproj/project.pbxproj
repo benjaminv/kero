@@ -352,7 +352,7 @@
 					"$(BUILT_PRODUCTS_DIR)/alacritty-bridge",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 0.1.47;
+				MARKETING_VERSION = 0.1.47-patch-20260817;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lkero_alacritty",
@@ -399,7 +399,7 @@
 					"$(BUILT_PRODUCTS_DIR)/alacritty-bridge",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 0.1.47;
+				MARKETING_VERSION = 0.1.47-patch-20260817;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lkero_alacritty",
