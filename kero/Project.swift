@@ -50,11 +50,19 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// Re-publish it through the project just like a terminal's live title and
     /// working directory.
     private var browserObservations: [UUID: AnyCancellable] = [:]
+    /// Resolved at terminal creation time so every project and split in this
+    /// window follows its currently associated shared AI profile.
+    private let terminalEnvironment: () -> [String: String]
 
     /// Pass `createInitialSession: false` when restoring a saved project;
     /// the caller then rebuilds the tabs itself.
-    init(fallbackName: String, createInitialSession: Bool = true) {
+    init(
+        fallbackName: String,
+        createInitialSession: Bool = true,
+        terminalEnvironment: @escaping () -> [String: String] = { [:] }
+    ) {
         self.fallbackName = fallbackName
+        self.terminalEnvironment = terminalEnvironment
         if createInitialSession {
             newSession()
         }
@@ -263,7 +271,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
                 ?? selectedSession?.currentDirectoryPath,
             restoredHistory: restoredHistory,
             commandArguments: commandArguments,
-            environmentPath: environmentPath
+            environmentPath: environmentPath,
+            additionalEnvironment: terminalEnvironment()
         )
         session.onExited = { [weak self] session in
             // Already dead — just drop its pane, no second terminate.

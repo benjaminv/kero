@@ -13,6 +13,13 @@ Kero 的自动化主要是给 AI 编码 agent 用的。它让 agent 安全地操
 
 Kero 支持 Codex、Claude Code、Gemini CLI、Grok Build、OpenCode、Cursor Agent、Aider、Amp 和 Pi。如果现有 agent 配置与这项功能冲突，Kero 会原样保留它，让开关回到之前的状态，并在设置里显示错误。
 
+
+## 使用不同的 AI 账号
+
+同一个 Kero 窗口里的所有终端共享一个 AI 配置档。内置的 **System** 配置档使用你平常的 Codex 和 Claude 配置，因此在任意标签页登录或切换账号后，其他标签页随后启动的 CLI 也会自然使用该账号。Kero 不会读取或复制这些凭据。
+
+使用 **AI Profile → New Profile and Window…** 可隔离另一个账号。命名配置档会把 provider 配置、登录状态和会话历史保存在一起；选择 **AI Profile → New Window with…** 可用已有配置档打开另一个窗口。普通的新窗口会继承当前窗口的配置档。删除命名配置档前，请先关闭使用它的所有窗口；删除操作会把数据移到废纸篓。
+
 ## 直接说你想要什么
 
 告诉 agent 最终要达到的结果。例如：

@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Keep Codex and Claude accounts shared across every terminal in an AI-profile window, with separate profiles available in separate windows
+
 ## [0.1.47]
 
 - Let dictation and other accessibility tools enter text in terminal panes

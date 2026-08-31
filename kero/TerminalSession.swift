@@ -57,7 +57,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         initialDirectory: String? = nil,
         restoredHistory: String? = nil,
         commandArguments: [String]? = nil,
-        environmentPath: String? = nil
+        environmentPath: String? = nil,
+        additionalEnvironment: [String: String] = [:]
     ) {
         let sessionID = UUID()
         let directCommand = commandArguments.flatMap { $0.isEmpty ? nil : $0 }
@@ -79,7 +80,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             workingDirectory: directory,
             environment: Self.surfaceEnvironment(
                 pathOverride: environmentPath,
-                sessionID: sessionID
+                sessionID: sessionID,
+                additionalEnvironment: additionalEnvironment
             )
         )
 
@@ -297,7 +299,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
 
     private static func surfaceEnvironment(
         pathOverride: String?,
-        sessionID: UUID
+        sessionID: UUID,
+        additionalEnvironment: [String: String]
     ) -> [String: String] {
         var environment = [
             "TERM": "xterm-256color",
@@ -306,6 +309,10 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         environment.merge(
             KeroCLIService.shared.terminalEnvironment(for: sessionID),
             uniquingKeysWith: { _, cliValue in cliValue }
+        )
+        environment.merge(
+            additionalEnvironment,
+            uniquingKeysWith: { _, profileValue in profileValue }
         )
         if let pathOverride, !pathOverride.isEmpty {
             environment["PATH"] = pathOverride

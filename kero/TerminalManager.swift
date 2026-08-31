@@ -56,6 +56,10 @@ final class TerminalManager: nonisolated ObservableObject {
     /// every launch starts with it hidden.
     @Published var isFPSCounterVisible = false
     @Published private(set) var isCommandPaletteVisible = false
+    /// Stable shared CLI state selected when this window was created.
+    /// Account changes inside that state are immediately native to all of
+    /// its terminals.
+    @Published private(set) var aiProfileID: String
 
     /// Projects publish their own changes (session list, session selection);
     /// re-publish them so views observing the manager stay current.
@@ -84,6 +88,7 @@ final class TerminalManager: nonisolated ObservableObject {
     /// Live managers in window-creation order; the persisted snapshot is
     /// one entry per registered manager.
     private static var registry: [TerminalManager] = []
+    private static var pendingAIProfileIDs: [String] = []
     /// Read-only module access for the authenticated local automation router.
     /// Mutation and window ownership remain private to `TerminalManager`.
     static var automationManagers: [TerminalManager] { registry }
@@ -117,6 +122,9 @@ final class TerminalManager: nonisolated ObservableObject {
     private static var didReopenWindows = false
 
     init() {
+        aiProfileID = Self.pendingAIProfileIDs.isEmpty
+            ? (Self.registry.last?.aiProfileID ?? AIProfile.systemID)
+            : Self.pendingAIProfileIDs.removeFirst()
         if !Self.hasLoadedStore {
             Self.hasLoadedStore = true
             Self.pendingRestores = SessionStore.load()
@@ -192,6 +200,69 @@ final class TerminalManager: nonisolated ObservableObject {
 
     var selectedSession: TerminalSession? {
         selectedProject?.selectedSession
+    }
+
+    var aiProfile: AIProfile {
+        AIProfileStore.shared.profile(id: aiProfileID)
+    }
+
+    static func openWindow(withAIProfile id: String? = nil) {
+        let inherited = id ?? registry.last?.aiProfileID ?? AIProfile.systemID
+        pendingAIProfileIDs.append(AIProfileStore.shared.profile(id: inherited).id)
+        windowOpener?()
+    }
+
+    func createAIProfileWindow() {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "New AI Profile")
+        alert.informativeText = String(
+            localized: "Every terminal in the new window will share this profile’s Codex and Claude accounts."
+        )
+        let field = NSTextField(string: "")
+        field.placeholderString = String(localized: "Profile name")
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: String(localized: "Create Window"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            let profile = try AIProfileStore.shared.create(named: field.stringValue)
+            Self.openWindow(withAIProfile: profile.id)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
+    func deleteAIProfile() {
+        let inUse = Set(Self.registry.map(\.aiProfileID))
+        let candidates = AIProfileStore.shared.profiles.filter {
+            !$0.isSystem && !inUse.contains($0.id)
+        }
+        guard !candidates.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = String(localized: "No Unused AI Profiles")
+            alert.informativeText = String(
+                localized: "Close every window using a profile before deleting it."
+            )
+            alert.runModal()
+            return
+        }
+
+        let chooser = NSAlert()
+        chooser.messageText = String(localized: "Delete AI Profile")
+        chooser.informativeText = String(localized: "Its Codex and Claude data will be moved to the Trash.")
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
+        popup.addItems(withTitles: candidates.map(\.name))
+        chooser.accessoryView = popup
+        chooser.addButton(withTitle: String(localized: "Move to Trash"))
+        chooser.addButton(withTitle: String(localized: "Cancel"))
+        guard chooser.runModal() == .alertFirstButtonReturn else { return }
+        let profile = candidates[popup.indexOfSelectedItem]
+        do {
+            try AIProfileStore.shared.delete(id: profile.id)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     /// Diff stacks that should remain in the window hierarchy. The selected
@@ -357,7 +428,11 @@ final class TerminalManager: nonisolated ObservableObject {
         projectCounter += 1
         let project = Project(
             fallbackName: "Project \(projectCounter)",
-            createInitialSession: createInitialSession
+            createInitialSession: createInitialSession,
+            terminalEnvironment: { [weak self] in
+                guard let self else { return [:] }
+                return AIProfileStore.shared.environment(for: self.aiProfileID)
+            }
         )
         projectObservations[project.id] = project.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
@@ -927,7 +1002,8 @@ final class TerminalManager: nonisolated ObservableObject {
             selectedProjectIndex: projects.firstIndex { $0.id == selectedProjectID },
             isLeftSidebarVisible: isLeftSidebarVisible,
             isRightPanelVisible: isPanelVisible,
-            rightPanelTab: panelTab
+            rightPanelTab: panelTab,
+            aiProfileID: aiProfileID
         )
         return (snapshot, histories)
     }
@@ -1004,6 +1080,9 @@ final class TerminalManager: nonisolated ObservableObject {
     /// false when the snapshot holds nothing restorable. Sidebar state is
     /// applied even then — the window claimed this snapshot's layout.
     private func restore(from snapshot: SessionSnapshot) -> Bool {
+        aiProfileID = AIProfileStore.shared.profile(
+            id: snapshot.aiProfileID ?? AIProfile.systemID
+        ).id
         if let visible = snapshot.isLeftSidebarVisible { isLeftSidebarVisible = visible }
         if let visible = snapshot.isRightPanelVisible { isPanelVisible = visible }
         if let tab = snapshot.rightPanelTab { panelTab = tab }

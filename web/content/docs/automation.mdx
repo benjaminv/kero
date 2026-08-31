@@ -22,6 +22,19 @@ Agent, Aider, Amp, and Pi. If Kero finds an existing agent setup that conflicts
 with this feature, it leaves that setup unchanged, returns the toggle to its
 previous state, and shows the error in Settings.
 
+## Use separate AI accounts
+
+Every terminal in a Kero window shares one AI profile. The built-in **System**
+profile uses your normal Codex and Claude configuration, so signing in or
+switching accounts in any tab naturally affects later CLI launches in all the
+other tabs. Kero does not read or copy those credentials.
+
+Use **AI Profile → New Profile and Window…** to isolate another account. Named
+profiles keep provider configuration, login state, and session history together;
+choose **AI Profile → New Window with…** to open another window using one. A
+normal new window inherits the focused window’s profile. Close every window
+using a named profile before moving it to the Trash.
+
 ## Ask in plain language
 
 Tell your agent the outcome you want. For example:
