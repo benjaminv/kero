@@ -235,13 +235,13 @@ private struct KeroCommands: Commands {
         }
 
         CommandMenu("AI Profile") {
-            Button("Current: \(manager?.aiProfile.name ?? "System")") {}
+            Button("Current: \(manager?.aiProfile.displayName ?? String(localized: "System"))") {}
                 .disabled(true)
 
             Divider()
 
             ForEach(aiProfiles.profiles) { profile in
-                Button("New Window with \(profile.name)") {
+                Button("New Window with \(profile.displayName)") {
                     TerminalManager.openWindow(withAIProfile: profile.id)
                 }
             }

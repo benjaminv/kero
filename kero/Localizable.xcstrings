@@ -567,6 +567,38 @@
     "Agents" : {
 
     },
+    "AI Profile" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AIプロファイル"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AI 配置文件"
+          }
+        }
+      }
+    },
+    "An AI profile with that name already exists." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同じ名前のAIプロファイルがすでに存在します。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已存在同名的 AI 配置文件。"
+          }
+        }
+      }
+    },
     "Allow" : {
       "localizations" : {
         "ja" : {
@@ -1230,6 +1262,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "关闭文件"
+          }
+        }
+      }
+    },
+    "Close every window using a profile before deleting it." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイルを削除する前に、そのプロファイルを使用しているすべてのウインドウを閉じてください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除配置文件前，请关闭所有正在使用该配置文件的窗口。"
           }
         }
       }
@@ -1959,6 +2007,22 @@
         }
       }
     },
+    "Create Window" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ウインドウを作成"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "创建窗口"
+          }
+        }
+      }
+    },
     "Create branch %@" : {
       "localizations" : {
         "ja" : {
@@ -2006,6 +2070,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "发布分离 HEAD 前，请先创建或切换到分支"
+          }
+        }
+      }
+    },
+    "Current: %@" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在：%@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "当前：%@"
           }
         }
       }
@@ -2121,6 +2201,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "要删除 %@ 吗？其内容将移到废纸篓。"
+          }
+        }
+      }
+    },
+    "Delete AI Profile" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AIプロファイルを削除"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除 AI 配置文件"
+          }
+        }
+      }
+    },
+    "Delete Profile…" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイルを削除…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除配置文件…"
           }
         }
       }
@@ -2518,6 +2630,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "均分窗格"
+          }
+        }
+      }
+    },
+    "Enter a profile name." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイル名を入力してください。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入配置文件名称。"
+          }
+        }
+      }
+    },
+    "Every terminal in the new window will share this profile’s Codex and Claude accounts." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新しいウインドウ内のすべてのターミナルで、このプロファイルのCodexおよびClaudeアカウントが共有されます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新窗口中的所有终端将共享此配置文件的 Codex 和 Claude 账户。"
           }
         }
       }
@@ -3482,6 +3626,22 @@
         }
       }
     },
+    "Its Codex and Claude data will be moved to the Trash." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CodexとClaudeのデータはゴミ箱に移動されます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "其 Codex 和 Claude 数据将移到废纸篓。"
+          }
+        }
+      }
+    },
     "It could not be written to disk." : {
       "localizations" : {
         "ja" : {
@@ -3920,6 +4080,22 @@
         }
       }
     },
+    "New AI Profile" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新規AIプロファイル"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建 AI 配置文件"
+          }
+        }
+      }
+    },
     "New branch name" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -4081,6 +4257,22 @@
         }
       }
     },
+    "New Profile and Window…" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新規プロファイルとウインドウ…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建配置文件和窗口…"
+          }
+        }
+      }
+    },
     "New Session" : {
       "localizations" : {
         "ja" : {
@@ -4157,6 +4349,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "新建窗口"
+          }
+        }
+      }
+    },
+    "New Window with %@" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@で新規ウインドウ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用 %@ 新建窗口"
           }
         }
       }
@@ -4323,6 +4531,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "没有已打开的项目"
+          }
+        }
+      }
+    },
+    "No Unused AI Profiles" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未使用のAIプロファイルはありません"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有未使用的 AI 配置文件"
           }
         }
       }
@@ -4876,6 +5100,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "项目目录（工作树）"
+          }
+        }
+      }
+    },
+    "Profile name" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイル名"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配置文件名称"
+          }
+        }
+      }
+    },
+    "Profile names must be 80 characters or fewer and cannot contain control characters." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイル名は80文字以内で、制御文字を含めることはできません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配置文件名称不得超过 80 个字符，且不能包含控制字符。"
           }
         }
       }
@@ -6704,6 +6960,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "文本编辑"
+          }
+        }
+      }
+    },
+    "The System AI profile cannot be deleted." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "システムAIプロファイルは削除できません。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法删除系统 AI 配置文件。"
           }
         }
       }

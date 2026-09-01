@@ -17,6 +17,7 @@ struct AIProfile: Codable, Identifiable, Equatable {
     var name: String
 
     var isSystem: Bool { id == Self.systemID }
+    var displayName: String { isSystem ? String(localized: "System") : name }
 }
 
 @MainActor
