@@ -4,6 +4,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 /// Keeps the traffic-light buttons aligned with the app's 38pt header bar:
@@ -147,5 +148,113 @@ extension NSWindow {
         default: // "Maximize" or unset
             performZoom(nil)
         }
+    }
+}
+
+/// The window's profile, shown as a pill in the header's drag area so the
+/// active CLI accounts are identifiable at a glance. Windows on the System
+/// profile show nothing: that is the unconfigured default, and a badge on
+/// every window would be noise.
+///
+/// The pill sits above the SwiftUI header rather than inside it, keeping new
+/// UI in AppKit. It never takes mouse events, so the window drag underneath
+/// still works.
+@MainActor
+final class ProfileBadgeView: NSView {
+    /// Header height (38) centered, minus the pill's own height.
+    private static let height: CGFloat = 20
+    /// Clears the right-sidebar toggle and the header's trailing padding.
+    private static let trailingInset: CGFloat = 40
+    private static let maximumWidth: CGFloat = 120
+    private static let horizontalPadding: CGFloat = 9
+
+    private var title = "" {
+        didSet {
+            guard title != oldValue else { return }
+            resize()
+            needsDisplay = true
+        }
+    }
+
+    private var observations: [AnyCancellable] = []
+
+    init(manager: TerminalManager) {
+        super.init(frame: .zero)
+        autoresizingMask = [.minXMargin, .minYMargin]
+        wantsLayer = true
+        observations = [
+            manager.$profileID.sink { [weak self] id in
+                MainActor.assumeIsolated { self?.apply(profileID: id) }
+            },
+            // @Published fires before the array is swapped in, so read the
+            // renamed profile on the next turn of the run loop.
+            ProfileStore.shared.$profiles.sink { [weak manager] _ in
+                DispatchQueue.main.async { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, let manager else { return }
+                        self.apply(profileID: manager.profileID)
+                    }
+                }
+            },
+            Theme.changes.objectWillChange.sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.needsDisplay = true }
+            },
+        ]
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// The header's own controls own every click in this region.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func apply(profileID: String) {
+        let profile = ProfileStore.shared.profile(id: profileID)
+        isHidden = profile.isSystem
+        title = profile.displayName
+    }
+
+    private var attributes: [NSAttributedString.Key: Any] {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        return [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: Theme.accent,
+            .paragraphStyle: paragraph,
+        ]
+    }
+
+    private func resize() {
+        guard let superview else { return }
+        let text = (title as NSString).size(withAttributes: attributes).width
+        let width = min(
+            Self.maximumWidth,
+            (text + Self.horizontalPadding * 2).rounded(.up)
+        )
+        frame = NSRect(
+            x: superview.bounds.width - Self.trailingInset - width,
+            y: superview.bounds.height - (38 + Self.height) / 2,
+            width: width,
+            height: Self.height
+        )
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        resize()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.accent.withAlphaComponent(0.14).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        let attributes = attributes
+        let size = (title as NSString).size(withAttributes: attributes)
+        let textRect = NSRect(
+            x: Self.horizontalPadding,
+            y: (bounds.height - size.height).rounded() / 2,
+            width: bounds.width - Self.horizontalPadding * 2,
+            height: size.height
+        )
+        (title as NSString).draw(in: textRect, withAttributes: attributes)
     }
 }

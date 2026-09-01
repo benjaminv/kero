@@ -233,6 +233,55 @@ final class TerminalManager: nonisolated ObservableObject {
         }
     }
 
+    /// Renames a named profile in place. The rename never reaches the
+    /// profile's id or directories, so signed-in CLIs stay signed in.
+    func renameProfile() {
+        let candidates = ProfileStore.shared.profiles.filter { !$0.isSystem }
+        guard !candidates.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Rename Profile")
+        alert.informativeText = String(
+            localized: "Only the name changes. The profile keeps its signed-in accounts."
+        )
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 280, height: 58))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
+        popup.addItems(withTitles: candidates.map(\.name))
+        if let index = candidates.firstIndex(where: { $0.id == profileID }) {
+            popup.selectItem(at: index)
+        }
+        let field = NSTextField(string: candidates[popup.indexOfSelectedItem].name)
+        field.placeholderString = String(localized: "Profile name")
+        // Selecting another profile refills the field with its current name,
+        // so the edit always starts from what that profile is called now.
+        let selection = ProfileSelectionRelay(names: candidates.map(\.name), field: field)
+        popup.target = selection
+        popup.action = #selector(ProfileSelectionRelay.popupChanged(_:))
+        stack.addArrangedSubview(popup)
+        stack.addArrangedSubview(field)
+        popup.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        field.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        alert.accessoryView = stack
+        alert.addButton(withTitle: String(localized: "Rename"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        alert.window.initialFirstResponder = field
+        // NSControl holds its target weakly; keep the relay alive for the
+        // whole modal session.
+        let response = withExtendedLifetime(selection) { alert.runModal() }
+        guard response == .alertFirstButtonReturn else { return }
+        do {
+            try ProfileStore.shared.rename(
+                id: candidates[popup.indexOfSelectedItem].id,
+                to: field.stringValue
+            )
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
     func deleteProfile() {
         let inUse = Set(Self.registry.map(\.profileID))
         let candidates = ProfileStore.shared.profiles.filter {
@@ -250,7 +299,7 @@ final class TerminalManager: nonisolated ObservableObject {
 
         let chooser = NSAlert()
         chooser.messageText = String(localized: "Delete Profile")
-        chooser.informativeText = String(localized: "Its Codex and Claude data will be moved to the Trash.")
+        chooser.informativeText = String(localized: "Its data will be moved to the Trash.")
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
         popup.addItems(withTitles: candidates.map(\.name))
         chooser.accessoryView = popup
@@ -346,6 +395,7 @@ final class TerminalManager: nonisolated ObservableObject {
     func attach(to window: NSWindow) {
         self.window = window
         Self.isOpeningWindow = false
+        installProfileBadge(in: window)
         let directories = Self.takePendingDirectories()
         if !directories.isEmpty, let startupProjectID,
            let startupProject = projects.first(where: { $0.id == startupProjectID }) {
@@ -359,6 +409,15 @@ final class TerminalManager: nonisolated ObservableObject {
         if !directories.isEmpty {
             window.makeKeyAndOrderFront(nil)
         }
+    }
+
+    /// The badge lives above the SwiftUI header, so it is added once per
+    /// window and left to its own autoresizing from there.
+    private func installProfileBadge(in window: NSWindow) {
+        guard let contentView = window.contentView,
+              !contentView.subviews.contains(where: { $0 is ProfileBadgeView })
+        else { return }
+        contentView.addSubview(ProfileBadgeView(manager: self))
     }
 
     private static func takePendingDirectories() -> [String] {
@@ -1121,5 +1180,25 @@ final class TerminalManager: nonisolated ObservableObject {
             selectedProjectID = projects.first?.id
         }
         return true
+    }
+}
+
+/// Keeps the rename sheet's text field in step with its profile popup.
+/// AppKit controls need an Objective-C target, which a struct or closure
+/// cannot supply.
+@MainActor
+private final class ProfileSelectionRelay: NSObject {
+    private let names: [String]
+    private let field: NSTextField
+
+    init(names: [String], field: NSTextField) {
+        self.names = names
+        self.field = field
+    }
+
+    @objc func popupChanged(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard names.indices.contains(index) else { return }
+        field.stringValue = names[index]
     }
 }

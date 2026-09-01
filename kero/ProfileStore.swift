@@ -95,6 +95,37 @@ final class ProfileStore: nonisolated ObservableObject {
         }
     }
 
+    /// Renames a named profile. Only the display name changes: the id and
+    /// every path derived from it stay byte-identical, so signed-in CLIs keep
+    /// their Keychain entries.
+    func rename(id: String, to proposedName: String) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }),
+              !profiles[index].isSystem else {
+            throw ProfileError.systemProfile
+        }
+        let name = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw ProfileError.emptyName }
+        guard name.count <= 80, name.unicodeScalars.allSatisfy({
+            !CharacterSet.controlCharacters.contains($0)
+        }) else {
+            throw ProfileError.invalidName
+        }
+        guard !profiles.contains(where: {
+            $0.id != id && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }) else {
+            throw ProfileError.duplicateName
+        }
+
+        let previous = profiles[index].name
+        profiles[index].name = name
+        do {
+            try save()
+        } catch {
+            profiles[index].name = previous
+            throw error
+        }
+    }
+
     /// Moves an unused named profile and its provider-owned data to Trash.
     func delete(id: String) throws {
         guard let index = profiles.firstIndex(where: { $0.id == id }),

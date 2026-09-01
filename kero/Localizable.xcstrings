@@ -3626,18 +3626,18 @@
         }
       }
     },
-    "Its Codex and Claude data will be moved to the Trash." : {
+    "Its data will be moved to the Trash." : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "CodexとClaudeのデータはゴミ箱に移動されます。"
+            "value" : "そのデータはゴミ箱に移動されます。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "其 Codex 和 Claude 数据将移到废纸篓。"
+            "value" : "其数据将移到废纸篓。"
           }
         }
       }
@@ -4663,6 +4663,22 @@
         }
       }
     },
+    "Only the name changes. The profile keeps its signed-in accounts." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "変更されるのは名前だけです。プロファイルのサインイン済みアカウントはそのまま維持されます。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅更改名称。该配置文件将保留其已登录的账户。"
+          }
+        }
+      }
+    },
     "Open a terminal directory first" : {
       "localizations" : {
         "ja" : {
@@ -5502,6 +5518,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重命名"
+          }
+        }
+      }
+    },
+    "Rename Profile" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイル名を変更"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重命名配置文件"
+          }
+        }
+      }
+    },
+    "Rename Profile…" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロファイル名を変更…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重命名配置文件…"
           }
         }
       }

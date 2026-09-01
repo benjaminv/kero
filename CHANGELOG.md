@@ -16,7 +16,7 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
-- Keep Codex and Claude accounts shared across every terminal in a profile window, with separate profiles available in separate windows
+- Keep Codex and Claude accounts shared across every terminal in a profile window, with separate profiles available in separate windows, the window's profile shown in its header, and profiles renamable at any time
 
 ## [0.1.47]
 

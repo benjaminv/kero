@@ -253,6 +253,11 @@ private struct KeroCommands: Commands {
             }
             .disabled(manager == nil)
 
+            Button("Rename Profile…") {
+                manager?.renameProfile()
+            }
+            .disabled(manager == nil || profileStore.profiles.count <= 1)
+
             Button("Delete Profile…") {
                 manager?.deleteProfile()
             }
