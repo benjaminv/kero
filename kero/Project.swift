@@ -51,7 +51,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// working directory.
     private var browserObservations: [UUID: AnyCancellable] = [:]
     /// Resolved at terminal creation time so every project and split in this
-    /// window follows its currently associated shared AI profile.
+    /// window follows its currently associated shared profile.
     private let terminalEnvironment: () -> [String: String]
 
     /// Pass `createInitialSession: false` when restoring a saved project;

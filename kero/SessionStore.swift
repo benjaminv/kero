@@ -203,9 +203,9 @@ struct SessionSnapshot: Codable {
     var isLeftSidebarVisible: Bool?
     var isRightPanelVisible: Bool?
     var rightPanelTab: RightPanel?
-    /// Shared AI profile associated with this window. Optional so snapshots
+    /// Shared profile associated with this window. Optional so snapshots
     /// from before profile support restore with the native system login.
-    var aiProfileID: String? = nil
+    var profileID: String? = nil
 }
 
 /// Persisted top level: one `SessionSnapshot` per open window, in

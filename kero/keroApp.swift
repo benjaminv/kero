@@ -66,7 +66,7 @@ private struct WindowRootView: View {
 private struct KeroCommands: Commands {
     @FocusedObject private var manager: TerminalManager?
     @Environment(\.openWindow) private var openWindow
-    @ObservedObject private var aiProfiles = AIProfileStore.shared
+    @ObservedObject private var profileStore = ProfileStore.shared
 
     var body: some Commands {
         let _ = TerminalManager.registerWindowOpener {
@@ -93,7 +93,7 @@ private struct KeroCommands: Commands {
 
             Button("New Window") {
                 TerminalManager.openWindow(
-                    withAIProfile: manager?.aiProfileID
+                    withProfile: manager?.profileID
                 )
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
@@ -234,27 +234,27 @@ private struct KeroCommands: Commands {
             }
         }
 
-        CommandMenu("AI Profile") {
-            Button("Current: \(manager?.aiProfile.displayName ?? String(localized: "System"))") {}
+        CommandMenu("Profile") {
+            Button("Current: \(manager?.profile.displayName ?? String(localized: "System"))") {}
                 .disabled(true)
 
             Divider()
 
-            ForEach(aiProfiles.profiles) { profile in
+            ForEach(profileStore.profiles) { profile in
                 Button("New Window with \(profile.displayName)") {
-                    TerminalManager.openWindow(withAIProfile: profile.id)
+                    TerminalManager.openWindow(withProfile: profile.id)
                 }
             }
 
             Divider()
 
             Button("New Profile and Window…") {
-                manager?.createAIProfileWindow()
+                manager?.createProfileWindow()
             }
             .disabled(manager == nil)
 
             Button("Delete Profile…") {
-                manager?.deleteAIProfile()
+                manager?.deleteProfile()
             }
             .disabled(manager == nil)
         }

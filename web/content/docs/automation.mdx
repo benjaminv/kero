@@ -24,16 +24,19 @@ previous state, and shows the error in Settings.
 
 ## Use separate AI accounts
 
-Every terminal in a Kero window shares one AI profile. The built-in **System**
+Every terminal in a Kero window shares one profile. The built-in **System**
 profile uses your normal Codex and Claude configuration, so signing in or
 switching accounts in any tab naturally affects later CLI launches in all the
 other tabs. Kero does not read or copy those credentials.
 
-Use **AI Profile → New Profile and Window…** to isolate another account. Named
+Use **Profile → New Profile and Window…** to isolate another account. Named
 profiles keep provider configuration, login state, and session history together;
-choose **AI Profile → New Window with…** to open another window using one. A
+choose **Profile → New Window with…** to open another window using one. A
 normal new window inherits the focused window’s profile. Close every window
 using a named profile before moving it to the Trash.
+
+Isolating a Claude account needs Claude Code 2.1.248 or newer. Older versions
+kept one shared login regardless of the profile.
 
 ## Ask in plain language
 

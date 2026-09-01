@@ -567,34 +567,34 @@
     "Agents" : {
 
     },
-    "AI Profile" : {
+    "Profile" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "AIプロファイル"
+            "value" : "プロファイル"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "AI 配置文件"
+            "value" : "配置文件"
           }
         }
       }
     },
-    "An AI profile with that name already exists." : {
+    "A profile with that name already exists." : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "同じ名前のAIプロファイルがすでに存在します。"
+            "value" : "同じ名前のプロファイルがすでに存在します。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "已存在同名的 AI 配置文件。"
+            "value" : "已存在同名的配置文件。"
           }
         }
       }
@@ -2205,18 +2205,18 @@
         }
       }
     },
-    "Delete AI Profile" : {
+    "Delete Profile" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "AIプロファイルを削除"
+            "value" : "プロファイルを削除"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "删除 AI 配置文件"
+            "value" : "删除配置文件"
           }
         }
       }
@@ -2650,18 +2650,18 @@
         }
       }
     },
-    "Every terminal in the new window will share this profile’s Codex and Claude accounts." : {
+    "Every terminal in the new window will share this profile’s accounts." : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "新しいウインドウ内のすべてのターミナルで、このプロファイルのCodexおよびClaudeアカウントが共有されます。"
+            "value" : "新しいウインドウ内のすべてのターミナルで、このプロファイルのアカウントが共有されます。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "新窗口中的所有终端将共享此配置文件的 Codex 和 Claude 账户。"
+            "value" : "新窗口中的所有终端将共享此配置文件的账户。"
           }
         }
       }
@@ -4080,18 +4080,18 @@
         }
       }
     },
-    "New AI Profile" : {
+    "New Profile" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "新規AIプロファイル"
+            "value" : "新規プロファイル"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "新建 AI 配置文件"
+            "value" : "新建配置文件"
           }
         }
       }
@@ -4535,18 +4535,18 @@
         }
       }
     },
-    "No Unused AI Profiles" : {
+    "No Unused Profiles" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "未使用のAIプロファイルはありません"
+            "value" : "未使用のプロファイルはありません"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有未使用的 AI 配置文件"
+            "value" : "没有未使用的配置文件"
           }
         }
       }
@@ -6964,18 +6964,18 @@
         }
       }
     },
-    "The System AI profile cannot be deleted." : {
+    "The System profile cannot be deleted." : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "システムAIプロファイルは削除できません。"
+            "value" : "システムプロファイルは削除できません。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无法删除系统 AI 配置文件。"
+            "value" : "无法删除系统配置文件。"
           }
         }
       }

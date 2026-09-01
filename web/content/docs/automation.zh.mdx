@@ -16,9 +16,11 @@ Kero 支持 Codex、Claude Code、Gemini CLI、Grok Build、OpenCode、Cursor Ag
 
 ## 使用不同的 AI 账号
 
-同一个 Kero 窗口里的所有终端共享一个 AI 配置档。内置的 **System** 配置档使用你平常的 Codex 和 Claude 配置，因此在任意标签页登录或切换账号后，其他标签页随后启动的 CLI 也会自然使用该账号。Kero 不会读取或复制这些凭据。
+同一个 Kero 窗口里的所有终端共享一个配置档。内置的 **System** 配置档使用你平常的 Codex 和 Claude 配置，因此在任意标签页登录或切换账号后，其他标签页随后启动的 CLI 也会自然使用该账号。Kero 不会读取或复制这些凭据。
 
-使用 **AI Profile → New Profile and Window…** 可隔离另一个账号。命名配置档会把 provider 配置、登录状态和会话历史保存在一起；选择 **AI Profile → New Window with…** 可用已有配置档打开另一个窗口。普通的新窗口会继承当前窗口的配置档。删除命名配置档前，请先关闭使用它的所有窗口；删除操作会把数据移到废纸篓。
+使用 **Profile → New Profile and Window…** 可隔离另一个账号。命名配置档会把 provider 配置、登录状态和会话历史保存在一起；选择 **Profile → New Window with…** 可用已有配置档打开另一个窗口。普通的新窗口会继承当前窗口的配置档。删除命名配置档前，请先关闭使用它的所有窗口；删除操作会把数据移到废纸篓。
+
+隔离 Claude 账号需要 Claude Code 2.1.248 或更新版本。更早的版本无论使用哪个配置档，都只保留一个共享登录。
 
 ## 直接说你想要什么
 
