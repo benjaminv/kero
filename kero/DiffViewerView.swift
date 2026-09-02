@@ -132,9 +132,10 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// editor, selection, and undo stack.
     private var editedNewContent = ""
     private var reloadGeneration: UInt = 0
-    /// The workspace the worktree side of this diff lives on. Git still runs
-    /// through `GitStatusModel`'s launcher on the local machine.
-    private let backend: WorkspaceBackend
+    /// The workspace this diff reads. The tab keeps its own, so it never
+    /// follows the session onto another machine — and re-binds to a new
+    /// connection to the same machine when one arrives.
+    private var backend: WorkspaceBackend
     /// The session this diff was opened from, watched for its workspace going
     /// away. Weak: closing the terminal must not keep it alive.
     private weak var session: TerminalSession?
@@ -143,7 +144,8 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// machines is two tabs, and a diff opened locally is never read-only.
     let workspaceIdentity: String?
     private var locationObservation: AnyCancellable?
-    private var connectionObservation: AnyCancellable?
+    private var stateObservation: AnyCancellable?
+    private var directoryObservation: AnyCancellable?
 
     init(
         repoRoot: String,
@@ -200,13 +202,38 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         guard let connection = location.remoteConnection,
               connection.workspaceIdentity == destination
         else {
-            connectionObservation = nil
+            stateObservation = nil
+            directoryObservation = nil
             setReadOnly(true, destination: destination)
             return
         }
-        connectionObservation = connection.$state.sink { [weak self] state in
-            self?.setReadOnly(state != .connected, destination: destination)
+        // The session reports a remote workspace only once the connection is
+        // connected *and* its directory has been discovered, so the diff
+        // becomes reachable on either of those changing.
+        stateObservation = connection.$state.sink { [weak self] _ in
+            self?.followReachability(destination: destination)
         }
+        directoryObservation = connection.$workingDirectory.sink { [weak self] _ in
+            self?.followReachability(destination: destination)
+        }
+    }
+
+    /// Adopts a live connection to this diff's own machine, or marks it
+    /// read-only. Re-binding matters as much as the banner: a reconnection is
+    /// a new channel, and running git over the dead one fails.
+    private func followReachability(destination: String) {
+        guard let session,
+              let connection = session.location.remoteConnection,
+              connection.workspaceIdentity == destination,
+              connection.state == .connected,
+              !(session.workspaceBackend is LocalWorkspaceBackend)
+        else {
+            setReadOnly(true, destination: destination)
+            return
+        }
+        backend = session.workspaceBackend
+        setReadOnly(false, destination: destination)
+        reload()
     }
 
     private func setReadOnly(_ isReadOnly: Bool, destination: String) {
@@ -254,7 +281,9 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     func reload() {
         // Keep the editor's document and undo history stable until the user
         // leaves edit mode, and never replace an unsaved buffer from disk.
-        guard !isEditing, !isDirty else { return }
+        // While the machine is unreachable both sides can only fail to load,
+        // and an error would replace the diff the user was reading.
+        guard readOnlyReason == nil, !isEditing, !isDirty else { return }
         reloadGeneration &+= 1
         let generation = reloadGeneration
         isLoading = true
@@ -348,7 +377,11 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
                 unmerged: git.unmerged,
                 editable: editable
             )
-            guard let self, self.reloadGeneration == generation else { return }
+            // The connection may have dropped while these reads were in
+            // flight; their failure must not become the tab's content.
+            guard let self, self.reloadGeneration == generation,
+                  self.readOnlyReason == nil
+            else { return }
             self.isLoading = false
             self.error = result.failure
             self.isUnmerged = result.unmerged

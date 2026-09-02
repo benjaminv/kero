@@ -62,10 +62,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     private var imageFingerprint: Int?
     private var reloadGeneration: UInt = 0
     private var reloadTask: Task<Void, Never>?
-    /// The workspace this file lives on. Assigned once by whoever opens the
-    /// tab; a remote file keeps reading and saving over that connection even
-    /// while the panels follow another session.
-    private let backend: WorkspaceBackend
+    /// The workspace this file lives on. The tab keeps its own, so it never
+    /// follows the session onto another machine — and re-binds to a new
+    /// connection to the same machine when one arrives.
+    private var backend: WorkspaceBackend
     /// The session this file was opened from, watched for its workspace going
     /// away. Weak: closing the terminal must not keep it alive.
     private weak var session: TerminalSession?
@@ -74,7 +74,8 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// machines is two tabs, and a file opened locally is never read-only.
     let workspaceIdentity: String?
     private var locationObservation: AnyCancellable?
-    private var connectionObservation: AnyCancellable?
+    private var stateObservation: AnyCancellable?
+    private var directoryObservation: AnyCancellable?
 
     private struct LoadedContent {
         let content: Content
@@ -128,13 +129,38 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         guard let connection = location.remoteConnection,
               connection.workspaceIdentity == destination
         else {
-            connectionObservation = nil
+            stateObservation = nil
+            directoryObservation = nil
             setReadOnly(true, destination: destination)
             return
         }
-        connectionObservation = connection.$state.sink { [weak self] state in
-            self?.setReadOnly(state != .connected, destination: destination)
+        // The session reports a remote workspace only once the connection is
+        // connected *and* its directory has been discovered, so the file
+        // becomes reachable on either of those changing.
+        stateObservation = connection.$state.sink { [weak self] _ in
+            self?.followReachability(destination: destination)
         }
+        directoryObservation = connection.$workingDirectory.sink { [weak self] _ in
+            self?.followReachability(destination: destination)
+        }
+    }
+
+    /// Adopts a live connection to this file's own machine, or marks the file
+    /// read-only. Re-binding matters as much as the banner: a reconnection is
+    /// a new channel, and reading or saving over the dead one fails.
+    private func followReachability(destination: String) {
+        guard let session,
+              let connection = session.location.remoteConnection,
+              connection.workspaceIdentity == destination,
+              connection.state == .connected,
+              !(session.workspaceBackend is LocalWorkspaceBackend)
+        else {
+            setReadOnly(true, destination: destination)
+            return
+        }
+        backend = session.workspaceBackend
+        setReadOnly(false, destination: destination)
+        reloadFromDiskIfClean()
     }
 
     private func setReadOnly(_ isReadOnly: Bool, destination: String) {
@@ -212,7 +238,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// the main actor; generation/path/dirty guards keep an older read from
     /// winning over a rename, save, or edit performed while it was in flight.
     func reloadFromDiskIfClean() {
-        guard !isDirty else { return }
+        // While the file's machine is unreachable a read can only fail, and
+        // replacing the content with "Could not read file" would throw away
+        // what the user was looking at. The banner already says why.
+        guard readOnlyReason == nil, !isDirty else { return }
         reloadTask?.cancel()
         reloadGeneration &+= 1
         let generation = reloadGeneration
@@ -225,7 +254,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
                   let self,
                   self.reloadGeneration == generation,
                   self.path == expectedPath,
-                  !self.isDirty
+                  !self.isDirty,
+                  // The connection may have dropped while this read was in
+                  // flight; its failure must not become the tab's content.
+                  self.readOnlyReason == nil
             else { return }
 
             let loaded = Self.loadedContent(path: expectedPath, data: data)
