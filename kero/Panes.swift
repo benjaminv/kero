@@ -41,9 +41,9 @@ extension PaneContent {
     @MainActor var title: String {
         switch self {
         case .session(let session): return session.title
-        case .file(let file): return file.name
+        case .file(let file): return file.tabTitle
         case .browser(let browser): return browser.title
-        case .diff(let diff): return diff.title
+        case .diff(let diff): return diff.tabTitle
         }
     }
 

@@ -350,14 +350,18 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// Opens `path` as a new file tab, reusing an existing tab/pane for the
     /// same path. `editorState` seeds scroll/cursor state when restoring.
     func openFile(_ path: String, editorState: EditorState? = nil) {
-        if let (tab, paneID) = findFilePane(path: path) {
+        // Capture the current directory context *before* selection moves to the
+        // new tab, so its panels track the tab the file was opened from. The
+        // same session decides which workspace the path belongs to, so the
+        // lookup below cannot reuse a tab from another machine.
+        let context = selectedSession
+        if let (tab, paneID) = findFilePane(
+            path: path, workspace: context?.workspaceIdentity
+        ) {
             selectedTabID = tab.id
             tab.focusedPaneID = paneID
             return
         }
-        // Capture the current directory context *before* selection moves to the
-        // new tab, so its panels track the tab the file was opened from.
-        let context = selectedSession
         let file = FileTab(path: path, session: context)
         if let editorState {
             file.editorState = editorState
@@ -376,23 +380,35 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             openFile(path)
             return
         }
+        let session = selectedSession
         if let existing = tab.allPanes.first(where: {
-            if case .file(let file) = $0.content { return file.path == path }
+            if case .file(let file) = $0.content {
+                return file.path == path
+                    && file.workspaceIdentity == session?.workspaceIdentity
+            }
             return false
         }) {
             tab.focusedPaneID = existing.id
             return
         }
         tab.split(
-            Pane(content: .file(FileTab(path: path, session: selectedSession))),
+            Pane(content: .file(FileTab(path: path, session: session))),
             toward: .right
         )
     }
 
-    private func findFilePane(path: String) -> (tab: PaneTab, paneID: UUID)? {
+    /// A tab is the same tab only when it holds the same path *on the same
+    /// machine*: `/etc/hosts` here and `/etc/hosts` on a remote are two files,
+    /// and reusing one tab for both would show one machine's contents while
+    /// saving to the other.
+    private func findFilePane(
+        path: String, workspace: String?
+    ) -> (tab: PaneTab, paneID: UUID)? {
         for tab in tabs {
             if let pane = tab.allPanes.first(where: {
-                if case .file(let file) = $0.content { return file.path == path }
+                if case .file(let file) = $0.content {
+                    return file.path == path && file.workspaceIdentity == workspace
+                }
                 return false
             }) {
                 return (tab, pane.id)
@@ -475,8 +491,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     func openDiff(
         repoRoot: String, path: String, staged: Bool, untracked: Bool, origPath: String?
     ) {
+        let context = selectedSession
         if let (tab, pane) = findDiffPane(
-            repoRoot: repoRoot, path: path, staged: staged, commitHash: nil
+            repoRoot: repoRoot, path: path, staged: staged, commitHash: nil,
+            workspace: context?.workspaceIdentity
         ),
            case .diff(let diff) = pane.content {
             diff.untracked = untracked
@@ -486,7 +504,6 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             tab.focusedPaneID = pane.id
             return
         }
-        let context = selectedSession
         let diff = DiffTab(
             repoRoot: repoRoot, path: path, staged: staged,
             untracked: untracked, origPath: origPath,
@@ -508,8 +525,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         status: Character,
         origPath: String?
     ) {
+        let context = selectedSession
         if let (tab, pane) = findDiffPane(
-            repoRoot: repoRoot, path: path, staged: false, commitHash: commitHash
+            repoRoot: repoRoot, path: path, staged: false, commitHash: commitHash,
+            workspace: context?.workspaceIdentity
         ), case .diff(let diff) = pane.content {
             diff.origPath = origPath
             diff.reload()
@@ -517,7 +536,6 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             tab.focusedPaneID = pane.id
             return
         }
-        let context = selectedSession
         let diff = DiffTab(
             repoRoot: repoRoot,
             path: path,
@@ -536,7 +554,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     }
 
     private func findDiffPane(
-        repoRoot: String, path: String, staged: Bool, commitHash: String?
+        repoRoot: String, path: String, staged: Bool, commitHash: String?,
+        workspace: String?
     ) -> (tab: PaneTab, pane: Pane)? {
         for tab in tabs {
             if let pane = tab.allPanes.first(where: {
@@ -545,6 +564,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
                         && diff.path == path
                         && diff.staged == staged
                         && diff.commitHash == commitHash
+                        && diff.workspaceIdentity == workspace
                 }
                 return false
             }) {

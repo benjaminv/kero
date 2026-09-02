@@ -138,9 +138,10 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// The session this diff was opened from, watched for its workspace going
     /// away. Weak: closing the terminal must not keep it alive.
     private weak var session: TerminalSession?
-    /// The remote this diff was opened from, if any. A diff opened locally is
-    /// never read-only, whatever its session does afterwards.
-    private let remoteDestination: String?
+    /// The workspace this diff belongs to: nil for this Mac, else the machine
+    /// it was opened from. Part of the tab's identity, so the same path on two
+    /// machines is two tabs, and a diff opened locally is never read-only.
+    let workspaceIdentity: String?
     private var locationObservation: AnyCancellable?
     private var connectionObservation: AnyCancellable?
 
@@ -158,7 +159,7 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     ) {
         self.session = session
         self.backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
-        remoteDestination = session?.location.remoteConnection?.destination
+        workspaceIdentity = session?.workspaceIdentity
         self.repoRoot = repoRoot
         self.path = path
         self.staged = staged
@@ -175,9 +176,9 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         web.onFileEditComplete = { [weak self] fileID, contents in
             self?.completeEditing(fileID: fileID, contents: contents)
         }
-        if let session, let remoteDestination {
+        if let session, let workspaceIdentity {
             locationObservation = session.$location.sink { [weak self] location in
-                self?.follow(location, destination: remoteDestination)
+                self?.follow(location, destination: workspaceIdentity)
             }
         }
         reload()
@@ -197,7 +198,7 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// reconnecting ssh is still asking for credentials.
     private func follow(_ location: WorkspaceLocation, destination: String) {
         guard let connection = location.remoteConnection,
-              connection.destination == destination
+              connection.workspaceIdentity == destination
         else {
             connectionObservation = nil
             setReadOnly(true, destination: destination)
@@ -241,6 +242,13 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         return staged
             ? String(localized: "\(name) (Staged)", comment: "Tab title for the staged diff of a file.")
             : name
+    }
+
+    /// Tab strip and switcher label. A remote diff says which machine it is
+    /// on; a local diff reads exactly as it always has.
+    var tabTitle: String {
+        guard let workspaceIdentity else { return title }
+        return "\(workspaceIdentity): \(title)"
     }
 
     func reload() {

@@ -69,9 +69,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// The session this file was opened from, watched for its workspace going
     /// away. Weak: closing the terminal must not keep it alive.
     private weak var session: TerminalSession?
-    /// The remote this file was opened from, if any. A file opened locally is
-    /// never read-only, whatever its session does afterwards.
-    private let remoteDestination: String?
+    /// The workspace this file belongs to: nil for this Mac, else the machine
+    /// it was opened from. Part of the tab's identity, so the same path on two
+    /// machines is two tabs, and a file opened locally is never read-only.
+    let workspaceIdentity: String?
     private var locationObservation: AnyCancellable?
     private var connectionObservation: AnyCancellable?
 
@@ -92,7 +93,7 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         // that connection even while the panels follow another session.
         let backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
         self.backend = backend
-        remoteDestination = session?.location.remoteConnection?.destination
+        workspaceIdentity = session?.workspaceIdentity
         // This initializer is synchronous (a file opens from a menu, a click,
         // or session restore), so a workspace that can answer immediately does
         // so here rather than flashing a placeholder on every open.
@@ -106,8 +107,8 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         if case .loading = content {
             reloadFromDiskIfClean()
         }
-        if let session, let remoteDestination {
-            observeWorkspace(of: session, destination: remoteDestination)
+        if let session, let workspaceIdentity {
+            observeWorkspace(of: session, destination: workspaceIdentity)
         }
     }
 
@@ -125,7 +126,7 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// reconnecting ssh is still asking for credentials.
     private func follow(_ location: WorkspaceLocation, destination: String) {
         guard let connection = location.remoteConnection,
-              connection.destination == destination
+              connection.workspaceIdentity == destination
         else {
             connectionObservation = nil
             setReadOnly(true, destination: destination)
@@ -149,6 +150,13 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
 
     var name: String {
         (path as NSString).lastPathComponent
+    }
+
+    /// Tab strip and switcher label. A remote file says which machine it is
+    /// on; a local file reads exactly as it always has.
+    var tabTitle: String {
+        guard let workspaceIdentity else { return name }
+        return "\(workspaceIdentity): \(name)"
     }
 
     /// Re-points this tab at a new location after the file (or a directory

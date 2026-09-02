@@ -461,3 +461,20 @@ final class LocalWorkspaceBackend: WorkspaceBackend {
         return String(data: result.stdout, encoding: .utf8) ?? ""
     }
 }
+
+extension RemoteConnection {
+    /// Names the machine a file or diff belongs to. The port appears only when
+    /// it is not the default, so the common case reads as `user@host`.
+    var workspaceIdentity: String {
+        port == 22 ? destination : "\(destination):\(port)"
+    }
+}
+
+extension TerminalSession {
+    /// Which workspace a tab opened from this session belongs to. Nil is this
+    /// Mac, and two machines are different workspaces even at the same path —
+    /// which is what keeps a remote `/etc/hosts` from reusing the local tab.
+    var workspaceIdentity: String? {
+        location.remoteConnection?.workspaceIdentity
+    }
+}
