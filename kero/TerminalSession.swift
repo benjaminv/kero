@@ -365,6 +365,13 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         return value
     }
 
+    /// The workspace the right pane, editor and diff viewer operate on for
+    /// this session. Always the Mac's own disk today; a session ssh'd into a
+    /// remote machine will answer with a backend that runs over that channel.
+    var workspaceBackend: WorkspaceBackend {
+        LocalWorkspaceBackend.shared
+    }
+
     // MARK: - Launch
 
     private static func surfaceEnvironment(
