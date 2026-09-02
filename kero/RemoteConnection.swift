@@ -68,6 +68,9 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
     nonisolated let sshPID: pid_t
 
     @Published private(set) var state: State = .connecting
+    /// One backend per connection: the models store whatever they are handed
+    /// each sync, so a fresh instance per access would be wasteful churn.
+    lazy var workspaceBackend: SSHWorkspaceBackend = SSHWorkspaceBackend(runner: self)
     /// Remote working directory, filled in by the cwd probe (not yet wired).
     @Published var workingDirectory: String?
 

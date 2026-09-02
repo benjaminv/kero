@@ -421,7 +421,7 @@ enum KeroAutomationRouter {
             )
         }
 
-        session.beginRemoteConnection(
+        let adopted = session.beginRemoteConnection(
             RemoteConnection(
                 user: user,
                 host: host,
@@ -430,6 +430,15 @@ enum KeroAutomationRouter {
                 sshPID: pid_t(pid)
             )
         )
+        guard adopted else {
+            // An ssh typed from inside an already-remote shell. Refusing here
+            // makes the helper hand over to a plain ssh rather than opening a
+            // control socket Kero would never watch.
+            return failure(
+                request, "remote_nested",
+                "This terminal is already connected to a remote machine."
+            )
+        }
         return success(request, .object(["socket": .string(socket.path)]))
     }
 

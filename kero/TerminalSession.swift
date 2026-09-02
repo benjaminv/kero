@@ -33,6 +33,10 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// through the automation socket, never guessed from the foreground
     /// process: an ssh Kero did not front cannot be followed.
     @Published var location: WorkspaceLocation = .local
+    /// The connection this session most recently left. Open editor tabs use it
+    /// to recognise their own remote after `exit` has returned the pane to the
+    /// local machine.
+    @Published private(set) var lastRemoteConnection: RemoteConnection?
 
     /// The emulator driving this session. Fixed for the session's lifetime —
     /// changing the setting only affects terminals opened afterwards.
@@ -215,14 +219,20 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// Adopts the connection Kero's `ssh` helper just announced and starts
     /// watching it. Exactly one connection per session: an `ssh` typed from
     /// inside an already-remote shell is nested and is not followed.
-    func beginRemoteConnection(_ connection: RemoteConnection) {
-        guard location.remoteConnection == nil else {
+    @discardableResult
+    func beginRemoteConnection(_ connection: RemoteConnection) -> Bool {
+        // A live connection means this ssh was typed from inside the remote
+        // shell. That is nested and Kero does not follow it. A connection that
+        // has already finished is simply the previous one, and the session is
+        // free to go remote again.
+        if let existing = location.remoteConnection, existing.state != .disconnected {
             NSLog(
                 "kero: ignoring nested ssh in terminal %@ (already remote)",
                 id.uuidString
             )
-            return
+            return false
         }
+        endRemoteConnection(reason: "replaced by a new connection")
         location = .remote(connection)
         // The connection is its own observable object, so republish its
         // changes or views bound to the session never see a state change.
@@ -232,31 +242,52 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         remoteMonitor = Task { [weak self] in
             await self?.watchRemoteConnection(connection)
         }
+        return true
     }
 
     func endRemoteConnection(reason: String) {
         remoteMonitor?.cancel()
         remoteMonitor = nil
         remoteObservation = nil
-        location.remoteConnection?.markDisconnected(reason: reason)
+        guard let connection = location.remoteConnection else { return }
+        connection.markDisconnected(reason: reason)
+        lastRemoteConnection = connection
+    }
+
+    /// The pane returns to the local machine only when the ssh process itself
+    /// is gone, which is what `exit` does. A connection that drops while ssh is
+    /// still running keeps the pane remote and disconnected on purpose: falling
+    /// back to local paths under a remote heading is the one outcome to avoid.
+    private func returnToLocal(_ connection: RemoteConnection, reason: String) {
+        connection.markDisconnected(reason: reason)
+        lastRemoteConnection = connection
+        location = .local
+        remoteObservation = nil
     }
 
     /// One check a second. While connecting, only the ssh process going away
     /// is a failure: the control socket does not exist until authentication
     /// finishes, and a password or a hardware key can take a while.
     private func watchRemoteConnection(_ connection: RemoteConnection) async {
+        var tick = 0
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             if Task.isCancelled { return }
+            tick += 1
 
             guard connection.isSSHProcessAlive else {
-                connection.markDisconnected(reason: "ssh process exited")
+                returnToLocal(connection, reason: "ssh process exited")
                 return
             }
             switch connection.state {
             case .connecting:
                 guard connection.controlSocketExists else { continue }
-                if await connection.check() { connection.markConnected() }
+                guard await connection.check() else { continue }
+                connection.markConnected()
+                // Probe straight away rather than waiting for the next tick:
+                // the backend and the panel path only switch to the remote
+                // together, once this answers.
+                await probeRemoteWorkingDirectory(connection)
             case .connected:
                 // The master removes its socket on exit, so this is both
                 // cheaper and faster than waiting for a check to fail.
@@ -264,13 +295,31 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
                     connection.markDisconnected(reason: "control socket removed")
                     return
                 }
-                if await connection.check() == false {
+                if tick.isMultiple(of: 2) {
+                    // One round trip per 2 s, matching the panel refresh.
+                    // `run` checks liveness itself and marks the connection
+                    // disconnected, so no separate check is needed here.
+                    await probeRemoteWorkingDirectory(connection)
+                } else if await connection.check() == false {
                     connection.markDisconnected(reason: "control socket check failed")
                     return
                 }
             case .disconnected:
                 return
             }
+        }
+    }
+
+    /// Finds the remote shell's directory over the shared channel. A miss
+    /// keeps the last known directory: the lookup can fail transiently while a
+    /// command is running, and dropping the path would bounce the panels.
+    private func probeRemoteWorkingDirectory(_ connection: RemoteConnection) async {
+        let found = try? await connection.workspaceBackend.remoteWorkingDirectory(
+            terminalTag: id.uuidString
+        )
+        guard let directory = found?.directory, !directory.isEmpty else { return }
+        if connection.workingDirectory != directory {
+            connection.workingDirectory = directory
         }
     }
 
@@ -303,6 +352,9 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// keeps describing the old tree. This is deliberately a separate fact:
     /// `currentDirectoryPath` must stay true to the shell.
     var foregroundDirectoryPath: String? {
+        // While the session is remote this would be the ssh client's own local
+        // directory, which means nothing on the other machine.
+        guard location.remoteConnection == nil else { return nil }
         guard let foreground = surface.foregroundPid, foreground > 0,
               foreground != shellPid
         else { return nil }
@@ -369,7 +421,33 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// this session. Always the Mac's own disk today; a session ssh'd into a
     /// remote machine will answer with a backend that runs over that channel.
     var workspaceBackend: WorkspaceBackend {
-        LocalWorkspaceBackend.shared
+        guard let connection = connectedRemote else { return LocalWorkspaceBackend.shared }
+        return connection.workspaceBackend
+    }
+
+    /// The directory the right pane, editor and diff viewer work in. The same
+    /// as ``currentDirectoryPath`` locally, and the remote shell's directory
+    /// once this session is connected to another machine.
+    ///
+    /// Deliberately separate from ``currentDirectoryPath``, which seeds new
+    /// local terminals and the saved session snapshot and must stay a path on
+    /// this Mac.
+    var panelDirectoryPath: String {
+        guard let directory = connectedRemote?.workingDirectory else {
+            return currentDirectoryPath
+        }
+        return directory
+    }
+
+    /// The remote this session is fully ready to work on. Both the backend and
+    /// the panel path read this, so the pane can never pair a remote backend
+    /// with a local path or the reverse.
+    private var connectedRemote: RemoteConnection? {
+        guard let connection = location.remoteConnection,
+              connection.state == .connected,
+              connection.workingDirectory != nil
+        else { return nil }
+        return connection
     }
 
     // MARK: - Launch
