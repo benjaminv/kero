@@ -358,7 +358,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         // Capture the current directory context *before* selection moves to the
         // new tab, so its panels track the tab the file was opened from.
         let context = selectedSession
-        let file = FileTab(path: path)
+        let file = FileTab(path: path, session: context)
         if let editorState {
             file.editorState = editorState
         }
@@ -383,7 +383,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             tab.focusedPaneID = existing.id
             return
         }
-        tab.split(Pane(content: .file(FileTab(path: path))), toward: .right)
+        tab.split(
+            Pane(content: .file(FileTab(path: path, session: selectedSession))),
+            toward: .right
+        )
     }
 
     private func findFilePane(path: String) -> (tab: PaneTab, paneID: UUID)? {
@@ -486,7 +489,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         let context = selectedSession
         let diff = DiffTab(
             repoRoot: repoRoot, path: path, staged: staged,
-            untracked: untracked, origPath: origPath
+            untracked: untracked, origPath: origPath,
+            session: context
         )
         let tab = makeTab(content: .diff(diff))
         tab.contextSession = context
@@ -522,7 +526,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             origPath: origPath,
             commitHash: commitHash,
             commitParentHash: parentHash,
-            commitStatus: status
+            commitStatus: status,
+            session: context
         )
         let tab = makeTab(content: .diff(diff))
         tab.contextSession = context
@@ -833,6 +838,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         case .session(let workingDirectory):
             return .session(makeSession(directory: workingDirectory, restoredHistory: restoredHistory))
         case .file(let path, let editorState):
+            // Restored tabs are always local: a remote connection does not
+            // survive a relaunch.
             let file = FileTab(path: path)
             if let editorState { file.editorState = editorState }
             return .file(file)

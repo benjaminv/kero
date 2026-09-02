@@ -411,6 +411,13 @@ private struct FileTreeRow: View {
         git.fileDecoration(for: item.path, isDirectory: item.isDirectory)
     }
 
+    /// Whether this row names a file on another machine. A connection that has
+    /// dropped still counts: the path is remote either way, and handing it to
+    /// Finder would open whatever sits at the same path locally.
+    private var isRemote: Bool {
+        session?.location.remoteConnection != nil
+    }
+
     var body: some View {
         if item.isDraft {
             // The transient new-file/folder input row: no hover/menu, no
@@ -440,11 +447,14 @@ private struct FileTreeRow: View {
                 openToSide(item.path)
             }
         }
-        Button("Open in Default App") {
-            NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
-        }
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+        // Finder and the default app can only reach the local disk.
+        if !isRemote {
+            Button("Open in Default App") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+            }
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+            }
         }
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
@@ -466,12 +476,42 @@ private struct FileTreeRow: View {
         Button("Rename") {
             model.beginRename(item)
         }
-        Button("Move to Trash", role: .destructive) {
-            Task {
-                await model.moveToTrash(item)
-                refreshGitStatus()
+        if isRemote {
+            // No Trash on the remote: Freedesktop semantics vary between
+            // distributions and a silently misplaced file is worse than an
+            // explicit delete the user confirmed.
+            Button("Delete…", role: .destructive) {
+                guard confirmRemoteDelete() else { return }
+                Task {
+                    await model.delete(item)
+                    refreshGitStatus()
+                }
+            }
+        } else {
+            Button("Move to Trash", role: .destructive) {
+                Task {
+                    await model.moveToTrash(item)
+                    refreshGitStatus()
+                }
             }
         }
+    }
+
+    /// Names the full remote path, because there is nothing to undo it with.
+    private func confirmRemoteDelete() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(
+            localized: "Delete “\(item.name)” on \(session?.location.remoteConnection?.displayName ?? "the remote machine")?",
+            comment: "Remote delete confirmation. The placeholders are a file name and a remote machine as user@host."
+        )
+        alert.informativeText = String(
+            localized: "\(item.path) will be deleted. This cannot be undone — a remote file does not go to the Trash.",
+            comment: "Remote delete confirmation detail. The placeholder is a full path."
+        )
+        alert.addButton(withTitle: String(localized: "Delete"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Commits an inline rename and, when the file actually moved, tells the
@@ -2250,6 +2290,12 @@ private struct InfoPanel: View {
     private static let vsCodeURL = NSWorkspace.shared
         .urlForApplication(withBundleIdentifier: "com.microsoft.VSCode")
 
+    /// Whether these directories live on another machine. Finder and VS Code
+    /// would otherwise open whatever sits at the same path locally.
+    private var isRemote: Bool {
+        session?.location.remoteConnection != nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -2358,12 +2404,14 @@ private struct InfoPanel: View {
                 }
 
             HStack(spacing: 4) {
-                actionButton("Finder", systemImage: "arrow.up.forward.app") {
-                    NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: path)]
-                    )
+                if !isRemote {
+                    actionButton("Finder", systemImage: "arrow.up.forward.app") {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: path)]
+                        )
+                    }
                 }
-                if let vsCode = Self.vsCodeURL {
+                if !isRemote, let vsCode = Self.vsCodeURL {
                     actionButton("VS Code", systemImage: "chevron.left.forwardslash.chevron.right") {
                         NSWorkspace.shared.open(
                             [URL(fileURLWithPath: path)],

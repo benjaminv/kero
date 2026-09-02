@@ -91,6 +91,25 @@ final class FileTreeModel: nonisolated ObservableObject {
         await rebuild()
     }
 
+    /// Deletes `item` outright, then rebuilds so it drops out of the tree.
+    /// Used where the workspace has no Trash to move it to — a remote
+    /// machine — so the caller confirms with the user first.
+    func delete(_ item: Item) async {
+        do {
+            try await backend.delete(paths: [item.path])
+            expanded.remove(item.path)
+        } catch {
+            presentError(
+                String(
+                    localized: "Couldn’t delete “\(item.name)”.",
+                    comment: "File operation error. The placeholder is a file or folder name."
+                ),
+                error.localizedDescription
+            )
+        }
+        await rebuild()
+    }
+
     // MARK: - Rename
 
     func beginRename(_ item: Item) {

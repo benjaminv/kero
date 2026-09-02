@@ -42,6 +42,9 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
 
     @Published private(set) var isDirty = false
     @Published var saveError: String?
+    /// Why this file cannot be written, or nil while it is writable. Set when
+    /// the remote machine it lives on is no longer reachable.
+    @Published private(set) var readOnlyReason: String?
     /// Changes only when a clean tab picks up different bytes from disk. Text
     /// editors use this as their identity so an already-mounted pane is rebuilt
     /// with the new content while preserving its stored cursor/scroll state.
@@ -63,6 +66,14 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// tab; a remote file keeps reading and saving over that connection even
     /// while the panels follow another session.
     private let backend: WorkspaceBackend
+    /// The session this file was opened from, watched for its workspace going
+    /// away. Weak: closing the terminal must not keep it alive.
+    private weak var session: TerminalSession?
+    /// The remote this file was opened from, if any. A file opened locally is
+    /// never read-only, whatever its session does afterwards.
+    private let remoteDestination: String?
+    private var locationObservation: AnyCancellable?
+    private var connectionObservation: AnyCancellable?
 
     private struct LoadedContent {
         let content: Content
@@ -70,9 +81,18 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         let imageFingerprint: Int?
     }
 
-    init(path: String, backend: WorkspaceBackend = LocalWorkspaceBackend.shared) {
+    init(
+        path: String,
+        session: TerminalSession? = nil,
+        backend: WorkspaceBackend? = nil
+    ) {
         self.path = path
+        self.session = session
+        // Files opened from a remote session keep reading and writing over
+        // that connection even while the panels follow another session.
+        let backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
         self.backend = backend
+        remoteDestination = session?.location.remoteConnection?.destination
         // This initializer is synchronous (a file opens from a menu, a click,
         // or session restore), so a workspace that can answer immediately does
         // so here rather than flashing a placeholder on every open.
@@ -86,6 +106,45 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         if case .loading = content {
             reloadFromDiskIfClean()
         }
+        if let session, let remoteDestination {
+            observeWorkspace(of: session, destination: remoteDestination)
+        }
+    }
+
+    // MARK: - Remote workspace
+
+    private func observeWorkspace(of session: TerminalSession, destination: String) {
+        locationObservation = session.$location.sink { [weak self] location in
+            self?.follow(location, destination: destination)
+        }
+    }
+
+    /// A dropped connection makes the file read-only; a fresh connection to
+    /// the same machine makes it writable again. Anything short of
+    /// `.connected` counts as read-only, so the banner stays up while a
+    /// reconnecting ssh is still asking for credentials.
+    private func follow(_ location: WorkspaceLocation, destination: String) {
+        guard let connection = location.remoteConnection,
+              connection.destination == destination
+        else {
+            connectionObservation = nil
+            setReadOnly(true, destination: destination)
+            return
+        }
+        connectionObservation = connection.$state.sink { [weak self] state in
+            self?.setReadOnly(state != .connected, destination: destination)
+        }
+    }
+
+    private func setReadOnly(_ isReadOnly: Bool, destination: String) {
+        let reason = isReadOnly
+            ? String(
+                localized: "Disconnected from \(destination) — read-only until reconnected",
+                comment: "Editor banner. The placeholder is a remote machine as user@host."
+            )
+            : nil
+        guard readOnlyReason != reason else { return }
+        readOnlyReason = reason
     }
 
     var name: String {
@@ -123,6 +182,11 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
 
     func save() async {
         guard case .text = content, isDirty else { return }
+        // Refused, not silently dropped: the save-error bar says why.
+        if let readOnlyReason {
+            saveError = readOnlyReason
+            return
+        }
         invalidateReload()
         let written = text
         do {
@@ -242,6 +306,10 @@ struct FileViewerView: View {
             switch file.content {
             case .text:
                 VStack(spacing: 0) {
+                    if let reason = file.readOnlyReason {
+                        RemoteReadOnlyBanner(message: reason)
+                            .frame(height: 22)
+                    }
                     if let error = file.saveError {
                         saveErrorBar(error)
                     }

@@ -111,6 +111,9 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     @Published private(set) var isEditable = false
     @Published private(set) var isDirty = false
     @Published var saveError: String?
+    /// Why this file cannot be written, or nil while it is writable. Set when
+    /// the remote machine it lives on is no longer reachable.
+    @Published private(set) var readOnlyReason: String?
 
     let web = DiffWebModel()
 
@@ -132,6 +135,14 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// The workspace the worktree side of this diff lives on. Git still runs
     /// through `GitStatusModel`'s launcher on the local machine.
     private let backend: WorkspaceBackend
+    /// The session this diff was opened from, watched for its workspace going
+    /// away. Weak: closing the terminal must not keep it alive.
+    private weak var session: TerminalSession?
+    /// The remote this diff was opened from, if any. A diff opened locally is
+    /// never read-only, whatever its session does afterwards.
+    private let remoteDestination: String?
+    private var locationObservation: AnyCancellable?
+    private var connectionObservation: AnyCancellable?
 
     init(
         repoRoot: String,
@@ -142,9 +153,12 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         commitHash: String? = nil,
         commitParentHash: String? = nil,
         commitStatus: Character? = nil,
-        backend: WorkspaceBackend = LocalWorkspaceBackend.shared
+        session: TerminalSession? = nil,
+        backend: WorkspaceBackend? = nil
     ) {
-        self.backend = backend
+        self.session = session
+        self.backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
+        remoteDestination = session?.location.remoteConnection?.destination
         self.repoRoot = repoRoot
         self.path = path
         self.staged = staged
@@ -161,7 +175,51 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         web.onFileEditComplete = { [weak self] fileID, contents in
             self?.completeEditing(fileID: fileID, contents: contents)
         }
+        if let session, let remoteDestination {
+            locationObservation = session.$location.sink { [weak self] location in
+                self?.follow(location, destination: remoteDestination)
+            }
+        }
         reload()
+    }
+
+    /// Whether the file can be edited right now: a regular worktree file whose
+    /// machine is still reachable.
+    var isEditableNow: Bool {
+        isEditable && readOnlyReason == nil
+    }
+
+    // MARK: - Remote workspace
+
+    /// A dropped connection makes the diff read-only; a fresh connection to
+    /// the same machine makes it writable again. Anything short of
+    /// `.connected` counts as read-only, so the banner stays up while a
+    /// reconnecting ssh is still asking for credentials.
+    private func follow(_ location: WorkspaceLocation, destination: String) {
+        guard let connection = location.remoteConnection,
+              connection.destination == destination
+        else {
+            connectionObservation = nil
+            setReadOnly(true, destination: destination)
+            return
+        }
+        connectionObservation = connection.$state.sink { [weak self] state in
+            self?.setReadOnly(state != .connected, destination: destination)
+        }
+    }
+
+    private func setReadOnly(_ isReadOnly: Bool, destination: String) {
+        let reason = isReadOnly
+            ? String(
+                localized: "Disconnected from \(destination) — read-only until reconnected",
+                comment: "Diff banner. The placeholder is a remote machine as user@host."
+            )
+            : nil
+        guard readOnlyReason != reason else { return }
+        readOnlyReason = reason
+        // `isEditable` stays the file's own verdict, so an edit made before the
+        // connection dropped is still saveable once it comes back.
+        web.canEdit = isEditableNow
     }
 
     var name: String {
@@ -274,7 +332,7 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             self.error = result.failure
             self.isUnmerged = result.unmerged
             self.isEditable = result.editable && result.failure == nil
-            self.web.canEdit = self.isEditable
+            self.web.canEdit = self.isEditableNow
             self.web.oldContent = result.old
             self.web.newContent = result.new
             self.savedNewContent = result.new
@@ -331,16 +389,21 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     }
 
     func setEditing(_ isEditing: Bool) {
-        guard isEditable else { return }
+        guard isEditableNow else { return }
         DiffViewPreferences.shared.prefersEditing = isEditing
     }
 
     private var isEditing: Bool {
-        isEditable && DiffViewPreferences.shared.prefersEditing
+        isEditableNow && DiffViewPreferences.shared.prefersEditing
     }
 
     func save() async {
         guard isEditable, isDirty else { return }
+        // Refused, not silently dropped: the save-error bar says why.
+        if let readOnlyReason {
+            saveError = readOnlyReason
+            return
+        }
         let filePath = (repoRoot as NSString).appendingPathComponent(path)
         let written = editedNewContent
         do {
@@ -697,6 +760,10 @@ struct DiffViewerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let reason = diff.readOnlyReason {
+                RemoteReadOnlyBanner(message: reason)
+                    .frame(height: 22)
+            }
             if diff.isUnmerged {
                 conflictBanner
             }
@@ -785,10 +852,10 @@ struct DiffViewerView: View {
                 set: { diff.setDiffStyle($0) }
             ),
             isEditing: Binding(
-                get: { diff.isEditable && preferences.prefersEditing },
+                get: { diff.isEditableNow && preferences.prefersEditing },
                 set: { diff.setEditing($0) }
             ),
-            canEdit: diff.isEditable
+            canEdit: diff.isEditableNow
         )
         .frame(height: DiffViewerLayout.controlsHeight)
     }
