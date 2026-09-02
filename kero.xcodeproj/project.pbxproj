@@ -99,6 +99,7 @@
 				FF3FDD70300B6A7400112486 /* Frameworks */,
 				FF3FDD71300B6A7400112486 /* Resources */,
 				AA40000000000000000000A1 /* Install ssh helper symlink */,
+				AA40000000000000000000A2 /* Install zsh shell integration */,
 			);
 			buildRules = (
 			);
@@ -206,6 +207,19 @@
 			);
 			shellPath = /bin/sh;
 			shellScript = "# Kero prepends Contents/MacOS to every terminal's PATH, so a symlink\n# named ssh beside the app binary is what puts Kero in front of a typed\n# ssh. Relative target: the link must stay valid wherever the bundle goes.\nset -e\nln -sfn kero \"${CODESIGNING_FOLDER_PATH}/Contents/MacOS/ssh\"\n";
+		};
+		AA40000000000000000000A2 /* Install zsh shell integration */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			inputPaths = (
+				"$(SRCROOT)/shell-integration/zsh/.zshenv",
+			);
+			name = "Install zsh shell integration";
+			outputPaths = (
+				"$(CODESIGNING_FOLDER_PATH)/Contents/Resources/shell-integration/zsh/.zshenv",
+			);
+			shellPath = /bin/sh;
+			shellScript = "# Kero starts zsh with ZDOTDIR pointing at this directory, which is how a\n# typed `ssh` reaches Kero's helper. PATH cannot do the job: /etc/zprofile\n# runs path_helper, which puts the system directories first.\nset -e\ndestination=\"${CODESIGNING_FOLDER_PATH}/Contents/Resources/shell-integration/zsh\"\nmkdir -p \"$destination\"\ncp -f \"${SRCROOT}/shell-integration/zsh/.zshenv\" \"$destination/.zshenv\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

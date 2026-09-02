@@ -90,7 +90,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             workingDirectory: directory,
             environment: Self.surfaceEnvironment(
                 pathOverride: environmentPath,
-                sessionID: sessionID
+                sessionID: sessionID,
+                shellPath: shellPath
             )
         )
 
@@ -478,7 +479,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
 
     private static func surfaceEnvironment(
         pathOverride: String?,
-        sessionID: UUID
+        sessionID: UUID,
+        shellPath: String
     ) -> [String: String] {
         var environment = [
             "TERM": "xterm-256color",
@@ -488,11 +490,56 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             KeroCLIService.shared.terminalEnvironment(for: sessionID),
             uniquingKeysWith: { _, cliValue in cliValue }
         )
+        environment.merge(
+            zshIntegrationEnvironment(shellPath: shellPath),
+            uniquingKeysWith: { _, integrationValue in integrationValue }
+        )
         if let pathOverride, !pathOverride.isEmpty {
             environment["PATH"] = pathOverride
         }
         // Locale belongs to the user's shell environment. Kero's app language
         // must never synthesize or override LANG/LC_* for terminal processes.
+        return environment
+    }
+
+    /// Points zsh at Kero's own startup directory.
+    ///
+    /// The bundled `.zshenv` restores the user's `ZDOTDIR` and sources their
+    /// files before doing anything, so their shell starts exactly as it would
+    /// otherwise; it then adds an interactive `ssh` function that routes
+    /// through Kero's helper.
+    ///
+    /// This replaces shadowing `ssh` on `PATH`, which cannot work on macOS:
+    /// `/etc/zprofile` runs `path_helper`, which rebuilds `PATH` with the
+    /// system directories first and leaves anything Kero prepended behind
+    /// `/usr/bin`. A shell function is also the better tool, because it
+    /// applies only to what the user types and never to scripts or agents.
+    private static func zshIntegrationEnvironment(
+        shellPath: String
+    ) -> [String: String] {
+        guard (shellPath as NSString).lastPathComponent == "zsh",
+              let resources = Bundle.main.resourceURL,
+              let executables = Bundle.main.executableURL?.deletingLastPathComponent()
+        else { return [:] }
+
+        let directory = resources
+            .appendingPathComponent("shell-integration/zsh", isDirectory: true)
+        guard FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(".zshenv").path
+        ) else { return [:] }
+
+        var environment = [
+            "ZDOTDIR": directory.path,
+            // argv[0] must still be `ssh`, so this names the symlink rather
+            // than the app binary it points at.
+            "KERO_SSH_HELPER": executables.appendingPathComponent("ssh").path,
+        ]
+        // Only set when the user had one, so the bundled file can tell
+        // "restore this" from "there was none".
+        if let existing = ProcessInfo.processInfo.environment["ZDOTDIR"],
+           !existing.isEmpty {
+            environment["KERO_ZSH_ZDOTDIR"] = existing
+        }
         return environment
     }
 
