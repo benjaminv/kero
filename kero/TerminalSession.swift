@@ -54,6 +54,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     private let launchDirectoryURL: URL?
     private let shellPidFileURL: URL?
     private var cachedShellPid: pid_t?
+    /// True when this session's shell was started with Kero's zsh
+    /// integration. A session that had it and still ends up running a stock
+    /// ssh directly means the integration did not take, which the pane says
+    /// out loud rather than leaving the user to wonder.
+    private let zshIntegrationActive: Bool
     private var remoteMonitor: Task<Void, Never>?
     private var remoteObservation: AnyCancellable?
     private var lastHistorySnapshot: String?
@@ -76,6 +81,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         let directory = Self.validWorkingDirectory(initialDirectory)
         let artifacts = Self.makeLaunchArtifacts(restoredHistory: restoredHistory)
         let backend = AppSettings.shared.terminalBackend
+        let environment = Self.surfaceEnvironment(
+            pathOverride: environmentPath,
+            sessionID: sessionID,
+            shellPath: shellPath
+        )
         let script = Self.makeLaunchScript(
             backend: backend,
             shellPath: shellPath,
@@ -88,14 +98,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             arguments: ["-c", script],
             commandLine: "/bin/sh -c \(Self.shellQuote(script))",
             workingDirectory: directory,
-            environment: Self.surfaceEnvironment(
-                pathOverride: environmentPath,
-                sessionID: sessionID,
-                shellPath: shellPath
-            )
+            environment: environment
         )
 
         id = sessionID
+        zshIntegrationActive = environment["ZDOTDIR"] != nil
         self.shellPath = shellPath
         self.backend = backend
         launchWorkingDirectory = directory
@@ -457,11 +464,24 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// The kernel-reported image is used rather than the tab title, which is
     /// terminal output the remote can write.
     private var isRunningUnmanagedSSH: Bool {
+        unmanagedSSHExecutablePath != nil
+    }
+
+    /// Executable of a foreground ssh that did not come through Kero.
+    private var unmanagedSSHExecutablePath: String? {
         guard let foreground = surface.foregroundPid, foreground > 0,
               foreground != shellPid,
-              let path = processExecutablePath(pid: foreground)
-        else { return false }
-        return (path as NSString).lastPathComponent == "ssh"
+              let path = processExecutablePath(pid: foreground),
+              (path as NSString).lastPathComponent == "ssh"
+        else { return nil }
+        return path
+    }
+
+    /// True when this session had Kero's zsh integration and a stock ssh ran
+    /// anyway. The integration is meant to make that impossible, so saying so
+    /// turns a silent failure into a visible one.
+    var sshHelperWasBypassed: Bool {
+        zshIntegrationActive && unmanagedSSHExecutablePath == "/usr/bin/ssh"
     }
 
     /// The remote this session is fully ready to work on. Both the backend and

@@ -33,12 +33,24 @@ if [[ -o interactive ]] && [[ -n "${KERO_SSH_HELPER-}" ]]; then
     # Runs once, before the first prompt, which is after .zprofile, .zshrc and
     # .zlogin. Defining ssh any earlier would let the user's own files replace
     # it, and defining it in this file would be earlier still.
-    precmd_functions=(${precmd_functions:#kero_ssh_integration})
+    #
+    # A nested interactive zsh started by hand does not inherit the function,
+    # so ssh typed there is not followed. That is the same outcome as any
+    # other shell Kero is not in front of, and needs no fix.
+    add-zsh-hook -d precmd kero_ssh_integration
     unfunction kero_ssh_integration 2>/dev/null
 
     # The user's own ssh always wins.
     (( $+aliases[ssh] || $+functions[ssh] )) && return
     [[ -x "$KERO_SSH_HELPER" ]] || return
+
+    # Only stand in front of a stock ssh. Anyone running their own build, say
+    # ~/bin/ssh earlier on PATH, meant to run that one; the helper would pick a
+    # system ssh instead and quietly ignore their choice.
+    case "${commands[ssh]}" in
+      /usr/bin/ssh|/opt/homebrew/bin/ssh|/usr/local/bin/ssh) ;;
+      *) return ;;
+    esac
 
     ssh() {
       # Deliberately not `exec`: that would replace this interactive shell and
@@ -48,5 +60,6 @@ if [[ -o interactive ]] && [[ -n "${KERO_SSH_HELPER-}" ]]; then
       "$KERO_SSH_HELPER" "$@"
     }
   }
-  precmd_functions+=(kero_ssh_integration)
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd kero_ssh_integration
 fi
