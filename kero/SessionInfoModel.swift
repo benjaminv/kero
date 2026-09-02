@@ -105,8 +105,12 @@ final class SessionInfoModel: nonisolated ObservableObject {
         guard !isRefreshing else { return }
         isRefreshing = true
 
-        let (processes, ports, names) = await Self.snapshot(shellPid: pid, backend: backend)
+        // A workspace that cannot answer leaves the rows as they were: on a
+        // remote machine that is a connection that has gone away, and empty
+        // lists would claim nothing is running there.
+        let snapshot = await Self.snapshot(shellPid: pid, backend: backend)
         isRefreshing = false
+        guard let (processes, ports, names) = snapshot else { return }
         // A tab switch may have re-targeted us while the poll ran.
         guard shellPid == pid else { return }
         if self.processes != processes { self.processes = processes }
@@ -134,9 +138,9 @@ final class SessionInfoModel: nonisolated ObservableObject {
 
     private static func snapshot(
         shellPid: pid_t, backend: WorkspaceBackend
-    ) async -> ([ProcessItem], [PortItem], [pid_t: String]) {
+    ) async -> ([ProcessItem], [PortItem], [pid_t: String])? {
         guard let snapshot = try? await backend.processes(descendantsOf: shellPid)
-        else { return ([], [], [:]) }
+        else { return nil }
         let processes = snapshot.descendants.map {
             ProcessItem(
                 pid: $0.pid,

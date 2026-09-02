@@ -109,6 +109,13 @@ struct RightSidebarView: View {
     @State private var forwards: PortForwardController?
     @AppStorage("rightSidebarWidth") private var width: Double = 240
 
+    /// Changes whenever the selected session's connection appears, changes
+    /// state, or is replaced.
+    private var remoteConnectionToken: String {
+        guard let session = manager.selectedSession else { return "none" }
+        return workspaceEpoch(of: session)
+    }
+
     private var sidebarFontScale: CGFloat {
         CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
     }
@@ -257,6 +264,9 @@ struct RightSidebarView: View {
         // session.workingDirectory); resync at once so automatically rooted
         // panels follow the terminal without waiting for another event.
         .onChange(of: manager.selectedSession?.workingDirectory) { syncModels() }
+        // A connection appearing, connecting, dying or being replaced changes
+        // what the heading says; repaint it without waiting for the next tick.
+        .onChange(of: remoteConnectionToken) { applyRemoteHeading() }
         // Same for pinning/unpinning the project directory.
         .onChange(of: manager.selectedProject?.customDirectory) { syncModels() }
         .environment(\.sidebarFontScale, sidebarFontScale)
@@ -318,17 +328,17 @@ struct RightSidebarView: View {
     }
 
     private func syncModels() {
+        // Before the queue, not inside it: a refresh over a dead connection
+        // waits out its deadlines, and the heading must not wait with it.
+        applyRemoteHeading()
         syncQueue.run { await performSync() }
     }
 
-    private func performSync() async {
-        guard manager.isPanelVisible,
-              let project = manager.selectedProject,
-              let session = project.selectedSession
-        else { return }
-        // The panel path, not the session's own: once the session is on a
-        // remote machine these panels follow the remote shell's directory,
-        // while new local terminals and restore snapshots keep the local one.
+    /// The heading, and the forwards that belong to the current connection.
+    /// Cheap and synchronous — it reads published state and touches no
+    /// workspace, so it stays correct while the panels are stalled.
+    private func applyRemoteHeading() {
+        guard let session = manager.selectedProject?.selectedSession else { return }
         // What the heading says is a fact about the terminal, not about any
         // connection: an ssh Kero is not in front of has no connection at all
         // and still has to be reported.
@@ -340,6 +350,32 @@ struct RightSidebarView: View {
         if remoteHeaderState != headerState { remoteHeaderState = headerState }
         let controller = portForwards.controller(for: session.location.remoteConnection)
         if forwards !== controller { forwards = controller }
+    }
+
+    /// Which workspace a refresh belongs to. A connection changing state, or
+    /// being replaced, makes results that were already in flight stale.
+    private func workspaceEpoch(of session: TerminalSession) -> String {
+        guard let connection = session.location.remoteConnection else { return "local" }
+        return "\(connection.id) \(connection.state)"
+    }
+
+    private func performSync() async {
+        guard manager.isPanelVisible,
+              let project = manager.selectedProject,
+              let session = project.selectedSession
+        else { return }
+        // The panel path, not the session's own: once the session is on a
+        // remote machine these panels follow the remote shell's directory,
+        // while new local terminals and restore snapshots keep the local one.
+        // A dead connection answers nothing: every call below would wait out
+        // its own deadline, one after another, and stall the refresh loop for
+        // as long as the link stays down. The panels keep their last remote
+        // contents instead, which is what the heading is telling the user.
+        if let connection = session.location.remoteConnection,
+           connection.state == .disconnected {
+            return
+        }
+        let epoch = workspaceEpoch(of: session)
 
         let cwd = session.panelDirectoryPath
         let backend = session.workspaceBackend
@@ -354,6 +390,9 @@ struct RightSidebarView: View {
             foregroundAt: session.foregroundDirectoryPath,
             backend: backend
         )
+        // The connection may have died while that was in flight; its answer
+        // describes a workspace that is no longer the one on screen.
+        guard epoch == workspaceEpoch(of: session) else { return }
         if rootSource != source { rootSource = source }
         switch manager.panelTab {
         case .files:

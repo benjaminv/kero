@@ -270,15 +270,20 @@ final class FileTreeModel: nonisolated ObservableObject {
         isRebuilding = true
         repeat {
             rebuildPending = false
-            let out = await children(of: rootPath, depth: 0)
-            if out != items {
+            // A root that cannot be read leaves the tree as it was. On a
+            // remote workspace that is a connection that has gone away, and
+            // emptying the panel would claim the directory is empty.
+            if let out = await children(of: rootPath, depth: 0), out != items {
                 items = out
             }
         } while rebuildPending
         isRebuilding = false
     }
 
-    private func children(of dir: String, depth: Int) async -> [Item] {
+    /// The rows for one directory, or nil when it could not be read at all —
+    /// which the caller treats as "keep what is on screen" rather than "this
+    /// directory is empty".
+    private func children(of dir: String, depth: Int) async -> [Item]? {
         // Guard against runaway recursion through symlink cycles.
         guard depth < 32 else { return [] }
         var out: [Item] = []
@@ -291,7 +296,7 @@ final class FileTreeModel: nonisolated ObservableObject {
                 )
             )
         }
-        guard let entries = try? await backend.list(directory: dir) else { return out }
+        guard let entries = try? await backend.list(directory: dir) else { return nil }
 
         let rows = entries
             .filter { $0.name != ".git" }
@@ -310,8 +315,9 @@ final class FileTreeModel: nonisolated ObservableObject {
 
         for row in rows {
             out.append(row)
-            if row.isDirectory, expanded.contains(row.path) {
-                out.append(contentsOf: await children(of: row.path, depth: depth + 1))
+            if row.isDirectory, expanded.contains(row.path),
+               let descendants = await children(of: row.path, depth: depth + 1) {
+                out.append(contentsOf: descendants)
             }
         }
         return out
