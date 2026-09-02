@@ -71,6 +71,12 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
     /// One backend per connection: the models store whatever they are handed
     /// each sync, so a fresh instance per access would be wasteful churn.
     lazy var workspaceBackend: SSHWorkspaceBackend = SSHWorkspaceBackend(runner: self)
+    /// The same channel with a short deadline, used only for the liveness
+    /// probe. Panel work can afford to wait; a probe that waits is a drop
+    /// this session has not noticed yet.
+    lazy var livenessBackend: SSHWorkspaceBackend = SSHWorkspaceBackend(
+        runner: self, timeout: 5
+    )
     /// Remote working directory, filled in by the cwd probe.
     @Published var workingDirectory: String?
     /// The remote login shell's process id, found by the same probe. The Info
@@ -142,8 +148,6 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
     func markDisconnected(reason: String) {
         guard state != .disconnected else { return }
         state = .disconnected
-        workingDirectory = nil
-        shellProcessID = nil
         NSLog(
             "kero: remote connection %@ state disconnected (%@)",
             destination, reason
@@ -276,12 +280,17 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
         stdin: Data? = nil,
         timeout: TimeInterval = 20
     ) async throws -> (status: Int32, stdout: Data, stderr: Data) {
-        let ready = await MainActor.run { state == .connected }
-        guard ready, await check() else {
+        // Deliberately not gated on `.connected`: the liveness probe has to
+        // keep running while the connection is disconnected, or nothing could
+        // ever notice it coming back.
+        //
+        // `-O check` only asks the LOCAL multiplexing master, which answers
+        // happily with the network down, so it proves the socket is ours and
+        // nothing more. It is kept as the cheap fast-fail that stops ssh
+        // quietly opening a brand new connection once the master is gone.
+        guard controlSocketExists, await check() else {
             await MainActor.run {
-                if state == .connected {
-                    markDisconnected(reason: "control socket check failed")
-                }
+                markDisconnected(reason: "control socket is gone")
             }
             throw RemoteConnectionError.notConnected
         }

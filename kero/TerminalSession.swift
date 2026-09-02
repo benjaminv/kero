@@ -282,60 +282,89 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// finishes, and a password or a hardware key can take a while.
     private func watchRemoteConnection(_ connection: RemoteConnection) async {
         var tick = 0
+        var consecutiveFailures = 0
+
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             if Task.isCancelled { return }
-            tick += 1
 
+            // The only way back to the local machine is the ssh process
+            // ending, which is what `exit` does.
             guard connection.isSSHProcessAlive else {
                 returnToLocal(connection, reason: "ssh process exited")
                 return
             }
-            switch connection.state {
-            case .connecting:
-                guard connection.controlSocketExists else { continue }
+            // The master removes its socket when it goes; cheaper than asking.
+            guard connection.controlSocketExists else {
+                connection.markDisconnected(reason: "control socket removed")
+                continue
+            }
+
+            if connection.state == .connecting {
                 guard await connection.check() else { continue }
                 connection.markConnected()
-                // Probe straight away rather than waiting for the next tick:
-                // the backend and the panel path only switch to the remote
-                // together, once this answers.
+                // Probe at once rather than waiting a tick: the pane only
+                // switches to the remote once a directory is known.
                 await probeRemoteWorkingDirectory(connection)
-            case .connected:
-                // The master removes its socket on exit, so this is both
-                // cheaper and faster than waiting for a check to fail.
-                guard connection.controlSocketExists else {
-                    connection.markDisconnected(reason: "control socket removed")
-                    return
+                continue
+            }
+
+            tick += 1
+            guard tick.isMultiple(of: 2) else { continue }
+
+            // One real round trip every 2 s. This is the liveness test, not
+            // `-O check`: the multiplexing master runs on this Mac and keeps
+            // answering while the network is down, so only a command that
+            // reaches the other machine can tell a live link from a dead one.
+            if await probeRemoteWorkingDirectory(connection) {
+                consecutiveFailures = 0
+                if connection.state == .disconnected {
+                    connection.markConnected()
                 }
-                if tick.isMultiple(of: 2) {
-                    // One round trip per 2 s, matching the panel refresh.
-                    // `run` checks liveness itself and marks the connection
-                    // disconnected, so no separate check is needed here.
-                    await probeRemoteWorkingDirectory(connection)
-                } else if await connection.check() == false {
-                    connection.markDisconnected(reason: "control socket check failed")
-                    return
-                }
-            case .disconnected:
-                return
+                continue
+            }
+
+            consecutiveFailures += 1
+            // Two in a row before saying so: a single timeout can be a busy
+            // remote or a slow link, and a pane that flickers is worse than
+            // one that takes a few seconds to tell the truth.
+            if consecutiveFailures >= 2, connection.state == .connected {
+                connection.markDisconnected(reason: "no reply from the remote machine")
             }
         }
     }
 
-    /// Finds the remote shell's directory over the shared channel. A miss
-    /// keeps the last known directory: the lookup can fail transiently while a
-    /// command is running, and dropping the path would bounce the panels.
-    private func probeRemoteWorkingDirectory(_ connection: RemoteConnection) async {
-        let found = try? await connection.workspaceBackend.remoteWorkingDirectory(
-            terminalTag: id.uuidString
-        )
-        guard let found, !found.directory.isEmpty else { return }
+    /// Finds the remote shell's directory and process id over the shared
+    /// channel. Returns whether the round trip succeeded, which is what tells
+    /// a live connection from a dropped one.
+    ///
+    /// A miss keeps the last known values: the lookup can fail transiently
+    /// while a command is running, and the pane must keep describing the
+    /// remote machine rather than falling back to this Mac's paths.
+    @discardableResult
+    private func probeRemoteWorkingDirectory(
+        _ connection: RemoteConnection
+    ) async -> Bool {
+        let found: (pid: pid_t, directory: String)?
+        do {
+            // Only a thrown error means the round trip failed. `try?` would
+            // flatten "the remote answered, the shell was not found" into the
+            // same nil as "the remote never answered", and the pane would
+            // report a drop that had not happened.
+            found = try await connection.livenessBackend.remoteWorkingDirectory(
+                terminalTag: id.uuidString
+            )
+        } catch {
+            return false
+        }
+        guard let found, !found.directory.isEmpty else { return true }
         if connection.workingDirectory != found.directory {
             connection.workingDirectory = found.directory
         }
         if connection.shellProcessID != found.pid {
             connection.shellProcessID = found.pid
         }
+        return true
     }
 
     /// Short label for the sidebar: the tail of the current directory, if known.
@@ -518,12 +547,16 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         connectedRemote?.shellProcessID ?? shellPid
     }
 
-    /// The remote this session is fully ready to work on. Both the backend and
-    /// the panel path read this, so the pane can never pair a remote backend
-    /// with a local path or the reverse.
+    /// The remote this session is working on. Both the backend and the panel
+    /// path read this, so the pane can never pair a remote backend with a
+    /// local path or the reverse.
+    ///
+    /// Deliberately not restricted to `.connected`. A dropped connection keeps
+    /// describing the remote machine with its last known directory: showing
+    /// this Mac's files under a remote heading is the one outcome to avoid,
+    /// and remote work simply fails while the link is down.
     private var connectedRemote: RemoteConnection? {
         guard let connection = location.remoteConnection,
-              connection.state == .connected,
               connection.workingDirectory != nil
         else { return nil }
         return connection
