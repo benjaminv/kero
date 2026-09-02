@@ -260,7 +260,12 @@ final class GitStatusModel: nonisolated ObservableObject {
             .max { $0.directoryPriority < $1.directoryPriority }
     }
 
-    func sync(root: String) {
+    /// The workspace Git runs on. Local unless a session hands over a remote
+    /// one; nothing selects a remote backend yet.
+    private var backend: WorkspaceBackend = LocalWorkspaceBackend.shared
+
+    func sync(root: String, backend: WorkspaceBackend = LocalWorkspaceBackend.shared) {
+        self.backend = backend
         if root != rootPath {
             contextGeneration &+= 1
             rootPath = root
@@ -309,9 +314,12 @@ final class GitStatusModel: nonisolated ObservableObject {
             self.hasResolvedStatus = true
         }
 
+        let backend = backend
         Task { [weak self] in
             let result = await Task.detached(priority: .utility) {
-                Self.runGitStatus(in: root, recentCommitLimit: commitLimit)
+                await Self.runGitStatus(
+                    in: root, recentCommitLimit: commitLimit, backend: backend
+                )
             }.value
             guard let self, self.contextGeneration == generation,
                   self.statusRequestID == requestID,
@@ -726,6 +734,7 @@ final class GitStatusModel: nonisolated ObservableObject {
             finishedAt: nil
         )
 
+        let backend = backend
         Task { [weak self] in
             let batch = await Task.detached(priority: .userInitiated) {
                 var transcript: [String] = []
@@ -733,16 +742,19 @@ final class GitStatusModel: nonisolated ObservableObject {
                 var failureMessage: String?
 
                 if let expectedRepositoryRoot {
-                    guard Self.resolveRepositoryRoot(in: validationRoot) == expectedRepositoryRoot else {
+                    guard await Self.resolveRepositoryRoot(
+                        in: validationRoot, backend: backend
+                    ) == expectedRepositoryRoot else {
                         let message = String(localized: "Repository changed before the Git action could run. Review the current changes and try again.")
                         return CommandBatchResult(
                             output: message, failureCode: -1, failureMessage: message
                         )
                     }
                     if requiresStableHead {
-                        let liveStatus = Self.runGit(
+                        let liveStatus = await Self.runGit(
                             ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=no"],
-                            in: expectedRepositoryRoot
+                            in: expectedRepositoryRoot,
+                            backend: backend
                         )
                         let live = liveStatus.status == 0
                             ? Self.parseStatus(liveStatus.stdout)
@@ -763,7 +775,7 @@ final class GitStatusModel: nonisolated ObservableObject {
 
                 for args in commands {
                     transcript.append("$ git " + Self.displayCommand(args))
-                    let run = Self.runGit(args, in: dir)
+                    let run = await Self.runGit(args, in: dir, backend: backend)
                     let text = [run.stdout, run.stderr]
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
@@ -863,17 +875,21 @@ final class GitStatusModel: nonisolated ObservableObject {
             startedAt: Date(), finishedAt: nil
         )
 
+        let backend = backend
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                guard Self.resolveRepositoryRoot(in: validationRoot) == expectedRepositoryRoot else {
+                guard await Self.resolveRepositoryRoot(
+                    in: validationRoot, backend: backend
+                ) == expectedRepositoryRoot else {
                     return TrashResult(
                         moved: [],
                         failure: String(localized: "Repository changed before the file action could run. Review the current changes and try again.")
                     )
                 }
-                let liveStatus = Self.runGit(
+                let liveStatus = await Self.runGit(
                     ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=no"],
-                    in: expectedRepositoryRoot
+                    in: expectedRepositoryRoot,
+                    backend: backend
                 )
                 let live = liveStatus.status == 0 ? Self.parseStatus(liveStatus.stdout) : nil
                 guard let live,
@@ -888,8 +904,11 @@ final class GitStatusModel: nonisolated ObservableObject {
                 var failure: String?
                 for path in paths {
                     do {
-                        try FileManager.default.trashItem(
-                            at: base.appendingPathComponent(path), resultingItemURL: nil
+                        // One path per call: the local backend moves it to the
+                        // Trash exactly as before, and stopping at the first
+                        // failure still reports which files were moved.
+                        try await backend.delete(
+                            paths: [base.appendingPathComponent(path).path]
                         )
                         moved.append(path)
                     } catch {
@@ -1209,12 +1228,66 @@ final class GitStatusModel: nonisolated ObservableObject {
         )
     }
 
+    /// Runs Git wherever the workspace is. A local workspace goes through the
+    /// launcher above, unchanged: it keeps partial output when a command times
+    /// out, escalates to SIGKILL for a helper that ignores SIGTERM, and matches
+    /// its reader threads to the caller's quality of service, none of which the
+    /// generic backend does.
+    nonisolated static func runGit(
+        _ args: [String], in dir: String, timeout: TimeInterval? = nil,
+        backend: WorkspaceBackend
+    ) async -> (status: Int32, stdout: String, stderr: String) {
+        if backend is LocalWorkspaceBackend {
+            return runGit(args, in: dir, timeout: timeout)
+        }
+        let result = await remoteGitData(args, in: dir, timeout: timeout, backend: backend)
+        return (
+            result.status,
+            String(data: result.stdout, encoding: .utf8) ?? "",
+            result.stderr
+        )
+    }
+
+    /// Shared with the diff viewer, which needs the bytes rather than text: a
+    /// diff may not be valid UTF-8 and must survive the round trip unchanged.
+    ///
+    /// Reproduces the local launcher's contract - `-2` and the same message on
+    /// a timeout, `-1` and the system message when the command cannot run.
+    nonisolated static func remoteGitData(
+        _ args: [String], in dir: String, timeout: TimeInterval? = nil,
+        backend: WorkspaceBackend
+    ) async -> (status: Int32, stdout: Data, stderr: String) {
+        do {
+            let result = try await backend.run(
+                argv: ["git"] + args,
+                cwd: dir,
+                env: [
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "LC_ALL": "C",
+                ],
+                stdin: nil,
+                timeout: timeout
+            )
+            return (
+                result.status,
+                result.stdout,
+                String(data: result.stderr, encoding: .utf8) ?? ""
+            )
+        } catch WorkspaceError.timedOut {
+            return (-2, Data(), String(localized: "Git did not respond in time."))
+        } catch {
+            return (-1, Data(), error.localizedDescription)
+        }
+    }
+
     /// Resolves the active repository and distinguishes a normal non-repo
     /// directory from an actual Git failure that the UI should surface.
     private nonisolated static func runGitStatus(
         in root: String,
-        recentCommitLimit: Int
-    ) -> StatusLoadResult {
+        recentCommitLimit: Int,
+        backend: WorkspaceBackend
+    ) async -> StatusLoadResult {
         // A filesystem, Git helper, or corrupt repository must not leave the
         // initial sidebar spinner running forever. Share one deadline across
         // the full snapshot instead of allowing every detail command its own
@@ -1223,13 +1296,13 @@ final class GitStatusModel: nonisolated ObservableObject {
         let timeoutMessage = String(localized: "Git did not respond in time.")
         func statusGit(
             _ args: [String], in directory: String
-        ) -> (status: Int32, stdout: String, stderr: String) {
+        ) async -> (status: Int32, stdout: String, stderr: String) {
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { return (-2, "", timeoutMessage) }
-            return runGit(args, in: directory, timeout: remaining)
+            return await runGit(args, in: directory, timeout: remaining, backend: backend)
         }
 
-        let top = statusGit(["rev-parse", "--show-toplevel"], in: root)
+        let top = await statusGit(["rev-parse", "--show-toplevel"], in: root)
         guard top.status == 0 else {
             let failure = gitFailureMessage(
                 top,
@@ -1237,7 +1310,7 @@ final class GitStatusModel: nonisolated ObservableObject {
             )
             if top.status == 128,
                failure.localizedCaseInsensitiveContains("not a git repository"),
-               !containsGitMetadata(atOrAbove: root) {
+               !(await containsGitMetadata(atOrAbove: root, backend: backend)) {
                 return .notRepository
             }
             return .failed(failure)
@@ -1246,7 +1319,7 @@ final class GitStatusModel: nonisolated ObservableObject {
         guard !resolvedRoot.isEmpty else {
             return .failed(String(localized: "Git returned an empty repository path."))
         }
-        let status = statusGit(
+        let status = await statusGit(
             [
                 "status", "--porcelain=v2", "--branch", "-z",
                 "--untracked-files=all", "--ignored=matching",
@@ -1264,7 +1337,7 @@ final class GitStatusModel: nonisolated ObservableObject {
         var result = parseStatus(status.stdout)
         result.topLevel = resolvedRoot
 
-        let diff = statusGit(
+        let diff = await statusGit(
             result.hasHead
                 ? ["diff", "--numstat", "HEAD", "--"]
                 : ["diff", "--numstat", "--cached", "--"],
@@ -1279,7 +1352,7 @@ final class GitStatusModel: nonisolated ObservableObject {
         // the initial snapshot; add any edits made after staging as a second
         // layer so the toolbar still reflects all pending work.
         if !result.hasHead {
-            let unstaged = statusGit(["diff", "--numstat", "--"], in: resolvedRoot)
+            let unstaged = await statusGit(["diff", "--numstat", "--"], in: resolvedRoot)
             if unstaged.status == 0 {
                 let totals = parseNumstat(unstaged.stdout)
                 result.lineAdditions += totals.additions
@@ -1289,22 +1362,23 @@ final class GitStatusModel: nonisolated ObservableObject {
         // `git diff` intentionally omits untracked files. Count their text
         // lines as additions so the compact toolbar totals cover all pending
         // work reported by the porcelain snapshot.
-        result.lineAdditions += untrackedLineAdditions(
+        result.lineAdditions += await untrackedLineAdditions(
             for: result.entries,
-            in: resolvedRoot
+            in: resolvedRoot,
+            backend: backend
         )
 
         result.loadedDetails = true
         let repoRoot = resolvedRoot
 
-        let refs = statusGit(
+        let refs = await statusGit(
             ["for-each-ref", "--format=%(refname:short)", "refs/heads"], in: repoRoot
         )
         if refs.status == 0 {
             result.branches = refs.stdout.split(separator: "\n").map(String.init).sorted()
         }
 
-        let remoteRun = statusGit(["remote"], in: repoRoot)
+        let remoteRun = await statusGit(["remote"], in: repoRoot)
         if remoteRun.status == 0 {
             result.remotes = remoteRun.stdout.split(separator: "\n").map(String.init).sorted()
         }
@@ -1313,7 +1387,7 @@ final class GitStatusModel: nonisolated ObservableObject {
         // Prefer origin when more than one remote is present because that is
         // the repository the local branch list conventionally belongs to.
         if let remote = result.remotes.contains("origin") ? "origin" : result.remotes.first {
-            let remoteHead = statusGit(
+            let remoteHead = await statusGit(
                 ["symbolic-ref", "--quiet", "--short", "refs/remotes/\(remote)/HEAD"],
                 in: repoRoot
             )
@@ -1329,7 +1403,7 @@ final class GitStatusModel: nonisolated ObservableObject {
 
         // NUL-delimited name-status records preserve every valid path while
         // supplying the nested file rows used by the native commit graph.
-        let log = statusGit([
+        let log = await statusGit([
             "log", "-n", "\(recentCommitLimit + 1)", "--decorate=short",
             "--pretty=format:%x1e%H%x1f%h%x1f%s%x1f%an%x1f%ct%x1f%P%x1f%D",
             "--name-status", "-z",
@@ -1340,23 +1414,27 @@ final class GitStatusModel: nonisolated ObservableObject {
             result.recentCommits = Array(commits.prefix(recentCommitLimit))
         }
 
-        let stash = statusGit(
+        let stash = await statusGit(
             ["rev-list", "--walk-reflogs", "--count", "refs/stash"], in: repoRoot
         )
         if stash.status == 0 {
             result.stashCount = Int(stash.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         }
 
-        let gitDir = statusGit(["rev-parse", "--absolute-git-dir"], in: repoRoot)
+        let gitDir = await statusGit(["rev-parse", "--absolute-git-dir"], in: repoRoot)
         if gitDir.status == 0 {
             let path = strippingTrailingLineEnding(gitDir.stdout)
-            result.repositoryOperation = detectRepositoryOperation(gitDirectory: path)
+            result.repositoryOperation = await detectRepositoryOperation(
+                gitDirectory: path, backend: backend
+            )
         }
         return .repository(result)
     }
 
-    private nonisolated static func resolveRepositoryRoot(in root: String) -> String? {
-        let top = runGit(["rev-parse", "--show-toplevel"], in: root)
+    private nonisolated static func resolveRepositoryRoot(
+        in root: String, backend: WorkspaceBackend
+    ) async -> String? {
+        let top = await runGit(["rev-parse", "--show-toplevel"], in: root, backend: backend)
         guard top.status == 0 else { return nil }
         let path = strippingTrailingLineEnding(top.stdout)
         return path.isEmpty ? nil : path
@@ -1365,8 +1443,9 @@ final class GitStatusModel: nonisolated ObservableObject {
     /// A malformed `.git` directory/file can produce the same rev-parse text
     /// as a plain folder. Preserve that as an actionable status error instead
     /// of offering to initialize a nested repository on top of broken metadata.
-    private nonisolated static func containsGitMetadata(atOrAbove root: String) -> Bool {
-        let fm = FileManager.default
+    private nonisolated static func containsGitMetadata(
+        atOrAbove root: String, backend: WorkspaceBackend
+    ) async -> Bool {
         // Walk path strings, not URLs: `URL.deletingLastPathComponent()` keeps
         // appending ".." at the filesystem root, so a URL ascent never
         // reaches its fixed point and spins forever. The NSString walk
@@ -1374,7 +1453,8 @@ final class GitStatusModel: nonisolated ObservableObject {
         var directory = URL(fileURLWithPath: root, isDirectory: true)
             .standardizedFileURL.path as NSString
         while true {
-            if fm.fileExists(atPath: directory.appendingPathComponent(".git")) {
+            let marker = directory.appendingPathComponent(".git")
+            if (try? await backend.stat(path: marker)) != nil {
                 return true
             }
             let parent = directory.deletingLastPathComponent as NSString
@@ -1481,8 +1561,8 @@ final class GitStatusModel: nonisolated ObservableObject {
     /// Git's numstat output has no representation for untracked files. Mirror
     /// its new-text-file behavior without spawning one Git process per path.
     private nonisolated static func untrackedLineAdditions(
-        for entries: [Entry], in root: String
-    ) -> Int {
+        for entries: [Entry], in root: String, backend: WorkspaceBackend
+    ) async -> Int {
         let rootURL = URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL
         let rootPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
 
@@ -1498,9 +1578,10 @@ final class GitStatusModel: nonisolated ObservableObject {
             visitedFiles += 1
             let fileURL = rootURL.appendingPathComponent(entry.path).standardizedFileURL
             guard fileURL.path.hasPrefix(rootPrefix) else { continue }
-            let count = textLineCount(
+            let count = await textLineCount(
                 at: fileURL,
-                maximumBytes: min(maximumFileBytes, remainingBytes)
+                maximumBytes: min(maximumFileBytes, remainingBytes),
+                backend: backend
             )
             total += count.lines
             remainingBytes -= count.bytesRead
@@ -1512,8 +1593,14 @@ final class GitStatusModel: nonisolated ObservableObject {
     /// Symlink content is its destination path, which is one added line.
     private nonisolated static func textLineCount(
         at url: URL,
-        maximumBytes: Int
-    ) -> (lines: Int, bytesRead: Int) {
+        maximumBytes: Int,
+        backend: WorkspaceBackend
+    ) async -> (lines: Int, bytesRead: Int) {
+        guard backend is LocalWorkspaceBackend else {
+            return await remoteTextLineCount(
+                at: url.path, maximumBytes: maximumBytes, backend: backend
+            )
+        }
         guard let values = try? url.resourceValues(
             forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
         ) else { return (0, 0) }
@@ -1546,6 +1633,24 @@ final class GitStatusModel: nonisolated ObservableObject {
 
         guard byteCount > 0 else { return (0, 0) }
         return (newlineCount + (lastByte == 0x0A ? 0 : 1), byteCount)
+    }
+
+    private nonisolated static func remoteTextLineCount(
+        at path: String, maximumBytes: Int, backend: WorkspaceBackend
+    ) async -> (lines: Int, bytesRead: Int) {
+        guard let stat = try? await backend.stat(path: path) else { return (0, 0) }
+        if stat.isSymlink { return (1, 0) }
+        guard stat.isRegular, stat.size <= maximumBytes,
+            let data = try? await backend.read(path: path, maxBytes: maximumBytes)
+        else { return (0, 0) }
+
+        let probe = data.prefix(8_000)
+        guard !probe.contains(0) else { return (0, probe.count) }
+        guard !data.isEmpty else { return (0, 0) }
+        let newlines = data.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        return (newlines + (data.last == 0x0A ? 0 : 1), data.count)
     }
 
     private static func fileDecoration(for entry: Entry) -> FileDecoration {
@@ -1623,26 +1728,30 @@ final class GitStatusModel: nonisolated ObservableObject {
         }
     }
 
-    nonisolated static func detectRepositoryOperation(gitDirectory: String) -> String? {
-        let fm = FileManager.default
+    nonisolated static func detectRepositoryOperation(
+        gitDirectory: String, backend: WorkspaceBackend
+    ) async -> String? {
         let git = URL(fileURLWithPath: gitDirectory, isDirectory: true)
-        func exists(_ name: String) -> Bool {
-            fm.fileExists(atPath: git.appendingPathComponent(name).path)
+        func exists(_ name: String) async -> Bool {
+            let path = git.appendingPathComponent(name).path
+            return (try? await backend.stat(path: path)) != nil
         }
 
-        if exists("rebase-merge") || exists("rebase-apply") {
+        let merging = await exists("rebase-merge")
+        let applying = await exists("rebase-apply")
+        if merging || applying {
             return String(localized: "Rebase in progress")
         }
-        if exists("MERGE_HEAD") {
+        if await exists("MERGE_HEAD") {
             return String(localized: "Merge in progress")
         }
-        if exists("CHERRY_PICK_HEAD") {
+        if await exists("CHERRY_PICK_HEAD") {
             return String(localized: "Cherry-pick in progress")
         }
-        if exists("REVERT_HEAD") {
+        if await exists("REVERT_HEAD") {
             return String(localized: "Revert in progress")
         }
-        if exists("BISECT_LOG") {
+        if await exists("BISECT_LOG") {
             return String(localized: "Bisect in progress")
         }
         return nil
