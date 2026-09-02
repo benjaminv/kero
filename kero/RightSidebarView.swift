@@ -358,9 +358,13 @@ struct RightSidebarView: View {
         case .git:
             break
         case .info:
+            // The panel pid, not the session's own: while remote these rows
+            // describe the remote login shell and its children, so filtering
+            // them by this Mac's shell pid would find nothing.
             await info.sync(
                 root: cwd, projectRoot: root, projectRootSource: source,
-                shellName: session.shellName, shellPid: session.shellPid,
+                shellName: session.shellName, shellPid: session.panelShellPid,
+                isRemote: session.location.remoteConnection != nil,
                 backend: backend
             )
         }

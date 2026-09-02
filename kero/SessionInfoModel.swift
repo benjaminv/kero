@@ -7,8 +7,10 @@ import Combine
 import Darwin
 import Foundation
 
-/// Polls `ps`/`lsof` for the active session's shell: the processes running
-/// under it and any TCP ports those processes are listening on.
+/// Polls the session's workspace for its shell: the processes running under it
+/// and any TCP ports those processes are listening on. The shell is the one on
+/// the machine the session is working on, which is a remote login shell while
+/// the session is connected to another machine.
 @MainActor
 final class SessionInfoModel: nonisolated ObservableObject {
     struct ProcessItem: Identifiable, Equatable {
@@ -56,6 +58,12 @@ final class SessionInfoModel: nonisolated ObservableObject {
     /// The workspace this panel describes. Replaced on every `sync`, so the
     /// panel follows its session between the local machine and a remote one.
     private var backend: WorkspaceBackend = LocalWorkspaceBackend.shared
+    /// Whether the shell being described is on another machine. While it is,
+    /// its name comes from that machine's process table rather than from the
+    /// local shell path, which describes a different process entirely.
+    private var isRemote = false
+    /// The local shell's name, used as given while local and as a fallback.
+    private var localShellName = ""
 
     func sync(
         root: String,
@@ -63,15 +71,25 @@ final class SessionInfoModel: nonisolated ObservableObject {
         projectRootSource: Project.PanelRootSource,
         shellName: String,
         shellPid: pid_t?,
+        isRemote: Bool,
         backend: WorkspaceBackend
     ) async {
         self.backend = backend
+        self.isRemote = isRemote
+        localShellName = shellName
         if rootPath != root { rootPath = root }
         if projectRootPath != projectRoot { projectRootPath = projectRoot }
         if self.projectRootSource != projectRootSource {
             self.projectRootSource = projectRootSource
         }
-        if self.shellName != shellName { self.shellName = shellName }
+        // A remote shell's name arrives with the process table in `refresh`.
+        // Until it does the header shows no name rather than the local
+        // shell's, which would label a remote pid with a process on this Mac.
+        if isRemote {
+            if self.shellName == shellName { self.shellName = "" }
+        } else if self.shellName != shellName {
+            self.shellName = shellName
+        }
         let pid = shellPid ?? 0
         if self.shellPid != pid { self.shellPid = pid }
         await refresh()
@@ -87,12 +105,14 @@ final class SessionInfoModel: nonisolated ObservableObject {
         guard !isRefreshing else { return }
         isRefreshing = true
 
-        let (processes, ports) = await Self.snapshot(shellPid: pid, backend: backend)
+        let (processes, ports, names) = await Self.snapshot(shellPid: pid, backend: backend)
         isRefreshing = false
         // A tab switch may have re-targeted us while the poll ran.
         guard shellPid == pid else { return }
         if self.processes != processes { self.processes = processes }
         if self.ports != ports { self.ports = ports }
+        let name = isRemote ? (names[pid] ?? "") : localShellName
+        if shellName != name { shellName = name }
     }
 
     /// SIGTERM (or SIGKILL when `force`), then a delayed re-poll so the
@@ -107,9 +127,9 @@ final class SessionInfoModel: nonisolated ObservableObject {
 
     private static func snapshot(
         shellPid: pid_t, backend: WorkspaceBackend
-    ) async -> ([ProcessItem], [PortItem]) {
+    ) async -> ([ProcessItem], [PortItem], [pid_t: String]) {
         guard let snapshot = try? await backend.processes(descendantsOf: shellPid)
-        else { return ([], []) }
+        else { return ([], [], [:]) }
         let processes = snapshot.descendants.map {
             ProcessItem(
                 pid: $0.pid,
@@ -131,6 +151,6 @@ final class SessionInfoModel: nonisolated ObservableObject {
                 processName: snapshot.namesByPid[$0.pid] ?? "?"
             )
         }
-        return (processes, ports)
+        return (processes, ports, snapshot.namesByPid)
     }
 }
