@@ -325,9 +325,12 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         let found = try? await connection.workspaceBackend.remoteWorkingDirectory(
             terminalTag: id.uuidString
         )
-        guard let directory = found?.directory, !directory.isEmpty else { return }
-        if connection.workingDirectory != directory {
-            connection.workingDirectory = directory
+        guard let found, !found.directory.isEmpty else { return }
+        if connection.workingDirectory != found.directory {
+            connection.workingDirectory = found.directory
+        }
+        if connection.shellProcessID != found.pid {
+            connection.shellProcessID = found.pid
         }
     }
 
@@ -485,6 +488,15 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// turns a silent failure into a visible one.
     var sshHelperWasBypassed: Bool {
         zshIntegrationActive && unmanagedSSHExecutablePath == "/usr/bin/ssh"
+    }
+
+    /// The shell the right pane should describe: the remote login shell while
+    /// this session is connected to another machine, and this Mac's own shell
+    /// otherwise. The Info panel filters processes by it, so handing it the
+    /// local pid while remote makes the panel describe a machine it is not
+    /// looking at.
+    var panelShellPid: pid_t? {
+        connectedRemote?.shellProcessID ?? shellPid
     }
 
     /// The remote this session is fully ready to work on. Both the backend and

@@ -71,8 +71,12 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
     /// One backend per connection: the models store whatever they are handed
     /// each sync, so a fresh instance per access would be wasteful churn.
     lazy var workspaceBackend: SSHWorkspaceBackend = SSHWorkspaceBackend(runner: self)
-    /// Remote working directory, filled in by the cwd probe (not yet wired).
+    /// Remote working directory, filled in by the cwd probe.
     @Published var workingDirectory: String?
+    /// The remote login shell's process id, found by the same probe. The Info
+    /// panel needs it to describe the shell on the other machine rather than
+    /// the local ssh client.
+    @Published var shellProcessID: pid_t?
 
     /// Unix socket paths are capped at 104 bytes by `sockaddr_un`, which rules
     /// out Application Support. Same `/tmp` convention as the automation
@@ -139,6 +143,7 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
         guard state != .disconnected else { return }
         state = .disconnected
         workingDirectory = nil
+        shellProcessID = nil
         NSLog(
             "kero: remote connection %@ state disconnected (%@)",
             destination, reason
