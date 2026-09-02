@@ -1185,8 +1185,11 @@ private struct GitPanel: View {
             Button("Copy Changed Paths") { copyChangedPaths() }
                 .disabled(model.totalChangeCount == 0)
             Button("Copy Repository Path") { copyToPasteboard(model.repoRoot) }
-            Button("Reveal Repository in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.repoRoot)])
+            // Finder can only show a path on this Mac.
+            if remoteName == nil {
+                Button("Reveal Repository in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.repoRoot)])
+                }
             }
         } label: {
             ZStack {
@@ -2436,8 +2439,10 @@ private struct GitEntryRow: View {
                 .disabled(disabled)
         }
         Divider()
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: absolutePath)])
+        if !isRemote {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: absolutePath)])
+            }
         }
         Button("Copy Path") {
             NSPasteboard.general.clearContents()

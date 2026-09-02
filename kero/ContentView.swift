@@ -327,11 +327,21 @@ struct ContentView: View {
             git.sync(root: "")
             return
         }
-        let root = project.panelRoot(
-            followingSessionAt: session.currentDirectoryPath,
-            foregroundAt: session.foregroundDirectoryPath
-        ).root
-        git.sync(root: root)
+        // The remote shell's directory once the session is connected, and the
+        // matching workspace, so the panel reads the repository on the machine
+        // the terminal is actually in. Resolving the root is a round trip
+        // there, hence the task.
+        let backend = session.workspaceBackend
+        let cwd = session.panelDirectoryPath
+        let foreground = session.foregroundDirectoryPath
+        Task {
+            let root = await project.panelRoot(
+                followingSessionAt: cwd,
+                foregroundAt: foreground,
+                backend: backend
+            ).root
+            git.sync(root: root, backend: backend)
+        }
     }
 
     @ViewBuilder
