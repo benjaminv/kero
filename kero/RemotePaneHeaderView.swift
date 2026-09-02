@@ -43,12 +43,20 @@ final class RemotePaneHeaderView: NSView {
         static let titleSize: CGFloat = 12
         static let subtitleSize: CGFloat = 10
         static let titleToSubtitle: CGFloat = 1
+        /// Matches the top padding the panel headings below use, so the first
+        /// line of the heading sits where a local session's first line does
+        /// instead of riding up against the tab strip.
+        static let topInset: CGFloat = 8
     }
 
     private let lamp = NSView(frame: .zero)
     private let label = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private var lampWidth: NSLayoutConstraint?
+    /// Hiding a view does not take it out of the layout, so the path's row is
+    /// collapsed explicitly; otherwise a heading with no path still reserves
+    /// one and the panel below it starts lower than it should.
+    private var subtitleHeight: NSLayoutConstraint?
 
     /// The directory the remote session is in, shown under the destination the
     /// way the panel headings show their path. Hidden while it is unknown,
@@ -108,7 +116,7 @@ final class RemotePaneHeaderView: NSView {
             label.leadingAnchor.constraint(
                 equalTo: lamp.trailingAnchor, constant: Metrics.gap),
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
-            label.topAnchor.constraint(equalTo: topAnchor),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: Metrics.topInset),
 
             subtitle.leadingAnchor.constraint(equalTo: label.leadingAnchor),
             subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
@@ -116,6 +124,7 @@ final class RemotePaneHeaderView: NSView {
                 equalTo: label.bottomAnchor, constant: Metrics.titleToSubtitle),
             subtitle.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        subtitleHeight = subtitle.heightAnchor.constraint(equalToConstant: 0)
 
         apply(state: .local)
         applyWorkingDirectory()
@@ -223,7 +232,9 @@ final class RemotePaneHeaderView: NSView {
     private func applyWorkingDirectory() {
         let path = workingDirectory ?? ""
         subtitle.stringValue = path
-        subtitle.isHidden = path.isEmpty || !Self.isProminent(state)
+        let hidden = path.isEmpty || !Self.isProminent(state)
+        subtitle.isHidden = hidden
+        subtitleHeight?.isActive = hidden
     }
 
     private func applyFont() {
