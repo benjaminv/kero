@@ -154,7 +154,10 @@ struct RightSidebarView: View {
                             fontScale: sidebarFontScale
                         )
                         .frame(height: remoteHeader.fittingSize.height)
-                        .padding(.horizontal, 8)
+                        // Same inset as the panel headings below, so the
+                        // destination and the shell row share a left edge.
+                        // The view supplies its own top inset.
+                        .padding(.horizontal, 12)
                         .padding(.bottom, 6)
                     }
                     switch manager.panelTab {
