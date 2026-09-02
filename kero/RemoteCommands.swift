@@ -238,6 +238,74 @@ nonisolated enum RemoteCommands {
             + "mv -f \"$1.kero-tmp\" \"$1\"' _ \(quote(path))"
     }
 
+    /// Counts the text lines of many files in ONE round trip.
+    ///
+    /// Asking per file costs two round trips each, which on a repository with a
+    /// few dozen untracked files is what pushes the Git snapshot past its
+    /// deadline. Paths arrive NUL-separated on standard input, so any filename
+    /// survives; one line comes back per path, `lines`, `bytesRead` and the
+    /// path itself, tab-separated with the path last because it is the only
+    /// field that may contain a tab.
+    ///
+    /// The rules match the local reader exactly: a symlink counts as one line
+    /// and no bytes, a file over the cap counts as nothing, a file whose first
+    /// 8 KB contain a NUL is binary and charges only that probe to the budget,
+    /// and a final line without a newline still counts.
+    ///
+    /// The script deliberately contains no single quote so it can be wrapped in
+    /// one, and runs under `bash` for its NUL-separated `read`.
+    static func untrackedLineCountsCommand(
+        totalByteBudget: Int, perFileByteCap: Int
+    ) -> String {
+        let script = """
+            budget=\(totalByteBudget); cap=\(perFileByteCap)
+            while IFS= read -r -d "" p; do
+            if [ "$budget" -le 0 ]; then break; fi
+            if [ -L "$p" ]; then printf "1\\t0\\t%s\\n" "$p"; continue; fi
+            if [ ! -f "$p" ]; then printf "0\\t0\\t%s\\n" "$p"; continue; fi
+            sz=$(stat -c %s -- "$p" 2>/dev/null || echo 0)
+            lim=$cap; if [ "$budget" -lt "$lim" ]; then lim=$budget; fi
+            if [ "$sz" -gt "$lim" ]; then printf "0\\t0\\t%s\\n" "$p"; continue; fi
+            if [ "$sz" -eq 0 ]; then printf "0\\t0\\t%s\\n" "$p"; continue; fi
+            probe=$(head -c 8000 -- "$p" | wc -c)
+            kept=$(head -c 8000 -- "$p" | LC_ALL=C tr -d "\\000" | wc -c)
+            if [ "$probe" -ne "$kept" ]; then
+            budget=$((budget - probe)); printf "0\\t%s\\t%s\\n" "$probe" "$p"; continue
+            fi
+            n=$(LC_ALL=C wc -l < "$p"); t=$(tail -c 1 -- "$p" | LC_ALL=C wc -l)
+            budget=$((budget - sz)); printf "%s\\t%s\\t%s\\n" "$((n + 1 - t))" "$sz" "$p"
+            done
+            """
+        // The newlines stay: they are the statement separators, and they
+        // survive quoting on the way to the remote shell.
+        return "bash -c '" + script + "'"
+    }
+
+    /// Paths for ``untrackedLineCountsCommand(totalByteBudget:perFileByteCap:)``
+    /// to read on standard input.
+    static func untrackedLineCountsInput(paths: [String]) -> Data {
+        var data = Data()
+        for path in paths {
+            data.append(contentsOf: Array(path.utf8))
+            data.append(0)
+        }
+        return data
+    }
+
+    static func parseUntrackedLineCounts(
+        _ output: String
+    ) -> [(path: String, lines: Int, bytesRead: Int)] {
+        output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3,
+                let lines = Int(fields[0]),
+                let bytes = Int(fields[1]),
+                !fields[2].isEmpty
+            else { return nil }
+            return (String(fields[2]), lines, bytes)
+        }
+    }
+
     // MARK: - Processes and ports
 
     /// `args` last, because it is the only column that contains spaces.
@@ -448,6 +516,25 @@ extension RemoteCommands {
         assert(atomicWriteCommand(path: "/home/ubuntu/a b.sh").hasSuffix("_ '/home/ubuntu/a b.sh'"))
         assert(atomicWriteCommand(path: "/tmp/x").contains("chmod --reference="))
         assert(atomicWriteCommand(path: "/tmp/x").contains("mv -f"))
+
+        let counts = untrackedLineCountsCommand(totalByteBudget: 32, perFileByteCap: 8)
+        assert(counts.hasPrefix("bash -c '") && counts.hasSuffix("'"))
+        // The script must carry no single quote of its own, or the wrapper ends early.
+        assert(!counts.dropFirst("bash -c '".count).dropLast().contains("'"))
+        assert(counts.contains("budget=32") && counts.contains("cap=8"))
+        assert(untrackedLineCountsInput(paths: ["/a b", "/c"]) == Data("/a b\u{0}/c\u{0}".utf8))
+
+        let countOutput = "3\t27\t/repo/a.txt\n1\t0\t/repo/link\n0\t8000\t/repo/blob.bin\n0\t0\t/repo/huge\n"
+        let parsedCounts = parseUntrackedLineCounts(countOutput)
+        assert(parsedCounts.count == 4)
+        assert(parsedCounts[0] == ("/repo/a.txt", 3, 27))
+        assert(parsedCounts[1] == ("/repo/link", 1, 0))
+        assert(parsedCounts[2] == ("/repo/blob.bin", 0, 8000))
+        assert(parsedCounts[3] == ("/repo/huge", 0, 0))
+        assert(parsedCounts.reduce(0) { $0 + $1.lines } == 4)
+        // A path containing a tab survives, because the path is the last field.
+        assert(parseUntrackedLineCounts("2\t4\t/repo/od\td")[0].path == "/repo/od\td")
+        assert(parseUntrackedLineCounts("rubbish").isEmpty)
 
         let psOutput = """
               313852  313851  0.0   6144 sshd: ubuntu@pts/0

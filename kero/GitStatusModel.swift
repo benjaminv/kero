@@ -264,8 +264,11 @@ final class GitStatusModel: nonisolated ObservableObject {
     /// one; nothing selects a remote backend yet.
     private var backend: WorkspaceBackend = LocalWorkspaceBackend.shared
 
-    func sync(root: String, backend: WorkspaceBackend = LocalWorkspaceBackend.shared) {
-        self.backend = backend
+    /// The backend is optional rather than defaulted to the shared local one:
+    /// a default argument is evaluated outside the actor, where that shared
+    /// instance cannot be read.
+    func sync(root: String, backend: WorkspaceBackend? = nil) {
+        self.backend = backend ?? LocalWorkspaceBackend.shared
         if root != rootPath {
             contextGeneration &+= 1
             rootPath = root
@@ -1573,6 +1576,38 @@ final class GitStatusModel: nonisolated ObservableObject {
         var remainingBytes = 32 * 1_024 * 1_024
         var visitedFiles = 0
         var total = 0
+
+        // Remotely these are one round trip for the whole set rather than two
+        // per file, which is the difference between a snapshot inside its
+        // deadline and one over it on a repository with untracked files.
+        if !(backend is LocalWorkspaceBackend) {
+            var paths: [String] = []
+            for entry in entries where entry.staged == "?" {
+                guard paths.count < maximumFiles else { break }
+                let fileURL = rootURL.appendingPathComponent(entry.path).standardizedFileURL
+                guard fileURL.path.hasPrefix(rootPrefix) else { continue }
+                paths.append(fileURL.path)
+            }
+            guard !paths.isEmpty else { return 0 }
+            let result = try? await backend.run(
+                argv: [
+                    "sh", "-c",
+                    RemoteCommands.untrackedLineCountsCommand(
+                        totalByteBudget: remainingBytes,
+                        perFileByteCap: maximumFileBytes
+                    ),
+                ],
+                cwd: root,
+                env: nil,
+                stdin: RemoteCommands.untrackedLineCountsInput(paths: paths),
+                timeout: nil
+            )
+            guard let result, result.status == 0 else { return 0 }
+            let counts = RemoteCommands.parseUntrackedLineCounts(
+                String(data: result.stdout, encoding: .utf8) ?? ""
+            )
+            return counts.reduce(0) { $0 + $1.lines }
+        }
         for entry in entries where entry.staged == "?" {
             guard visitedFiles < maximumFiles, remainingBytes > 0 else { break }
             visitedFiles += 1
