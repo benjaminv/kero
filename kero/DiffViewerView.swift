@@ -272,37 +272,50 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             // Git first, on its own thread, exactly as before.
             let git = await Task.detached(priority: .userInitiated) {
                 var failureVar: String?
-                let unmerged = commitHash == nil && !staged
-                    && Self.isUnmerged(path: path, in: root)
+                // Only a live worktree diff can be unmerged, and the check is
+                // a Git call, so it stays behind that test rather than inside
+                // a short-circuit that cannot await.
+                var unmerged = false
+                if commitHash == nil, !staged {
+                    unmerged = await Self.isUnmerged(
+                        path: path, in: root, backend: backend
+                    )
+                }
+                // A later side must not clear an earlier side's failure, so
+                // each result only overwrites it when it carries one.
+                func take(_ result: (text: String, error: String?)) -> String {
+                    if let error = result.error { failureVar = error }
+                    return result.text
+                }
                 let old: String
                 // Non-nil only when git supplies the "after" side too; a live
                 // worktree diff reads that side from the workspace below.
                 var newFromGit: String?
                 if let commitHash {
-                    old = Self.firstGitContent(
-                        ["\(commitHash)^:\(oldPath)"], in: root, error: &failureVar
-                    )
-                    newFromGit = Self.firstGitContent(
-                        ["\(commitHash):\(path)"], in: root, error: &failureVar
-                    )
+                    old = take(await Self.firstGitContent(
+                        ["\(commitHash)^:\(oldPath)"], in: root, backend: backend
+                    ))
+                    newFromGit = take(await Self.firstGitContent(
+                        ["\(commitHash):\(path)"], in: root, backend: backend
+                    ))
                 } else if staged {
-                    old = Self.firstGitContent(
-                        ["HEAD:\(oldPath)"], in: root, error: &failureVar
-                    )
-                    newFromGit = Self.firstGitContent(
-                        [":\(path)"], in: root, error: &failureVar
-                    )
+                    old = take(await Self.firstGitContent(
+                        ["HEAD:\(oldPath)"], in: root, backend: backend
+                    ))
+                    newFromGit = take(await Self.firstGitContent(
+                        [":\(path)"], in: root, backend: backend
+                    ))
                 } else if untracked {
                     old = ""
                 } else {
                     // An unmerged index has no stage-0 `:path`. Prefer our
                     // side, then the merge base, so conflict rows show a
                     // meaningful before-side instead of the whole file as new.
-                    old = Self.firstGitContent(
+                    old = take(await Self.firstGitContent(
                         [":\(oldPath)", ":2:\(oldPath)", ":1:\(oldPath)", "HEAD:\(oldPath)"],
                         in: root,
-                        error: &failureVar
-                    )
+                        backend: backend
+                    ))
                 }
                 return (
                     old: old,
@@ -432,32 +445,38 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         case tooLarge
     }
 
+    /// The first spec that exists, and the reason the diff cannot be shown if
+    /// one of them is unusable. The error is returned rather than written
+    /// through `inout` so it cannot cross a suspension point, and so a caller
+    /// reading two sides only overwrites its failure on a real one.
     private nonisolated static func firstGitContent(
-        _ specs: [String], in root: String, error: inout String?
-    ) -> String {
+        _ specs: [String], in root: String, backend: WorkspaceBackend
+    ) async -> (text: String, error: String?) {
         for spec in specs {
-            switch gitContent(spec, in: root) {
+            switch await gitContent(spec, in: root, backend: backend) {
             case .missing:
                 continue
             case .content(let content):
-                return content
+                return (content, nil)
             case .binary:
-                error = String(localized: "Binary file")
-                return ""
+                return ("", String(localized: "Binary file"))
             case .tooLarge:
-                error = String(localized: "File is too large to diff")
-                return ""
+                return ("", String(localized: "File is too large to diff"))
             }
         }
-        return ""
+        return ("", nil)
     }
 
-    private nonisolated static func gitContent(_ spec: String, in root: String) -> GitContent {
-        let size = GitStatusModel.runGit(["cat-file", "-s", spec], in: root)
+    private nonisolated static func gitContent(
+        _ spec: String, in root: String, backend: WorkspaceBackend
+    ) async -> GitContent {
+        let size = await GitStatusModel.runGit(
+            ["cat-file", "-s", spec], in: root, backend: backend
+        )
         guard size.status == 0 else { return .missing }
         let byteCount = Int(size.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         guard byteCount <= maxBytes else { return .tooLarge }
-        let run = runGitData(["cat-file", "blob", spec], in: root)
+        let run = await runGitData(["cat-file", "blob", spec], in: root, backend: backend)
         guard run.status == 0 else { return .missing }
         guard run.stdout.count <= maxBytes else { return .tooLarge }
         guard !run.stdout.contains(0),
@@ -466,6 +485,18 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             return .binary
         }
         return .content(content)
+    }
+
+    /// The same bytes from a workspace that may not be this machine. A local
+    /// workspace keeps the launcher below, whose capture limit and reader
+    /// priorities the generic backend does not reproduce.
+    private nonisolated static func runGitData(
+        _ args: [String], in root: String, backend: WorkspaceBackend
+    ) async -> (status: Int32, stdout: Data, stderr: String) {
+        if backend is LocalWorkspaceBackend {
+            return runGitData(args, in: root)
+        }
+        return await GitStatusModel.remoteGitData(args, in: root, backend: backend)
     }
 
     /// GitStatusModel's general runner intentionally exposes decoded text.
@@ -542,9 +573,12 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         )
     }
 
-    private nonisolated static func isUnmerged(path: String, in root: String) -> Bool {
-        let run = GitStatusModel.runGit(
-            ["--literal-pathspecs", "ls-files", "--unmerged", "--", path], in: root
+    private nonisolated static func isUnmerged(
+        path: String, in root: String, backend: WorkspaceBackend
+    ) async -> Bool {
+        let run = await GitStatusModel.runGit(
+            ["--literal-pathspecs", "ls-files", "--unmerged", "--", path],
+            in: root, backend: backend
         )
         return run.status == 0 && !run.stdout.isEmpty
     }
