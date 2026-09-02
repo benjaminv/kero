@@ -446,15 +446,21 @@ private struct FileTreePanel: View {
                         )
                         .accessibilityLabel(rootBadge.description)
                 }
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.rootPath)])
-                } label: {
-                    Image(systemName: "arrow.up.forward.app")
-                        .sidebarFont(size: 11)
-                        .foregroundStyle(.secondary)
+                // Finder can only reach the local disk; while remote this
+                // path names a directory on another machine.
+                if session?.location.remoteConnection == nil {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: model.rootPath)]
+                        )
+                    } label: {
+                        Image(systemName: "arrow.up.forward.app")
+                            .sidebarFont(size: 11)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reveal in Finder")
                 }
-                .buttonStyle(.plain)
-                .help("Reveal in Finder")
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
@@ -934,7 +940,7 @@ private struct GitPanel: View {
             .disabled(model.isBusy)
         }
         .confirmationDialog(
-            "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files go to the Trash.",
+            discardAllTitle,
             isPresented: Binding(
                 get: { confirmDiscardAll },
                 set: {
@@ -1723,6 +1729,7 @@ private struct GitPanel: View {
             entry: entry,
             status: status,
             kind: kind,
+            isRemote: remoteName != nil,
             disabled: model.isBusy,
             isStageLoading: operationIsLoading(stageTrigger),
             isUnstageLoading: operationIsLoading(unstageTrigger),
@@ -1761,8 +1768,35 @@ private struct GitPanel: View {
         }
     }
 
+    /// The machine a discard would act on, or nil while local.
+    private var remoteName: String? {
+        session?.location.remoteConnection?.displayName
+    }
+
     private func discardTitle(for entry: GitStatusModel.Entry?) -> String {
         guard let entry else { return "" }
+        // There is no Trash on the remote: these files are deleted outright,
+        // so the confirmation says so and names the full path.
+        if let remoteName {
+            if entry.isUntracked {
+                return String(
+                    localized: "Delete \(entry.path) on \(remoteName)? A remote file is deleted outright, not moved to the Trash.",
+                    comment: "Remote discard confirmation. The placeholders are a repository-relative path and a remote machine as user@host."
+                )
+            }
+            if entry.isWorktreeRename, let original = entry.origPath {
+                return String(
+                    localized: "Undo this rename? \(entry.path) is deleted on \(remoteName) and \(original) is restored.",
+                    comment: "Remote rename discard confirmation. The placeholders are the new path, a remote machine as user@host, and the old path."
+                )
+            }
+            if entry.isWorktreeCopy {
+                return String(
+                    localized: "Discard this copy? \(entry.path) is deleted on \(remoteName), not moved to the Trash.",
+                    comment: "Remote copy discard confirmation. The placeholders are a path and a remote machine as user@host."
+                )
+            }
+        }
         if entry.isUntracked {
             return String(
                 localized: "Delete \(entry.fileName)? Its contents will move to the Trash.",
@@ -1790,10 +1824,25 @@ private struct GitPanel: View {
     private func discardActionTitle(for entry: GitStatusModel.Entry?) -> String {
         guard let entry else { return String(localized: "Discard Changes") }
         if entry.isUntracked || entry.isWorktreeCopy {
-            return String(localized: "Move to Trash")
+            return remoteName == nil
+                ? String(localized: "Move to Trash")
+                : String(localized: "Delete")
         }
         if entry.isWorktreeRename { return String(localized: "Undo Rename") }
         return String(localized: "Discard Changes")
+    }
+
+    private var discardAllTitle: String {
+        guard let remoteName else {
+            return String(
+                localized: "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files go to the Trash.",
+                comment: "Discard-all confirmation. The placeholder is a number of changes."
+            )
+        }
+        return String(
+            localized: "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files are deleted outright on \(remoteName), not moved to the Trash.",
+            comment: "Remote discard-all confirmation. The placeholders are a number of changes and a remote machine as user@host."
+        )
     }
 
     private func makePendingDiscard(_ entry: GitStatusModel.Entry) -> PendingDiscard {
@@ -2156,6 +2205,9 @@ private struct GitEntryRow: View {
     let entry: GitStatusModel.Entry
     let status: Character
     let kind: Kind
+    /// Whether this repository is on another machine, where discarding an
+    /// untracked or copied file deletes it rather than moving it to the Trash.
+    let isRemote: Bool
     let disabled: Bool
     let isStageLoading: Bool
     let isUnstageLoading: Bool
@@ -2347,7 +2399,9 @@ private struct GitEntryRow: View {
 
     private var destructiveMenuTitle: String {
         if entry.isUntracked || entry.isWorktreeCopy {
-            return String(localized: "Move to Trash…")
+            return isRemote
+                ? String(localized: "Delete…")
+                : String(localized: "Move to Trash…")
         }
         if entry.isWorktreeRename { return String(localized: "Undo Rename…") }
         return String(localized: "Discard Changes…")
