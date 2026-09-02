@@ -177,8 +177,11 @@ nonisolated enum RemoteCommands {
     /// broken symlink fails the second `stat`, leaving one line.
     static func statCommand(path: String) -> String {
         let quoted = quote(path)
-        return "stat -c '%F\\t%s\\t%Y\\t%a' -- \(quoted) 2>/dev/null; "
-            + "stat -L -c '%F\\t%s\\t%Y\\t%a' -- \(quoted) 2>/dev/null"
+        // `--printf`, not `-c`: only the former interprets the tab and newline
+        // escapes, and `-c` would return the format string with them intact.
+        let format = "'%F\\t%s\\t%Y\\t%a\\n'"
+        return "stat --printf \(format) -- \(quoted) 2>/dev/null; "
+            + "stat -L --printf \(format) -- \(quoted) 2>/dev/null"
     }
 
     struct RemoteStat: Equatable {
@@ -400,6 +403,8 @@ extension RemoteCommands {
         assert(parseShellDiscovery("42 /home/ubuntu/my project")?.directory
             == "/home/ubuntu/my project")
 
+        assert(statCommand(path: "/tmp/x").contains("stat --printf '%F\\t%s\\t%Y\\t%a\\n' -- '/tmp/x'"))
+        assert(statCommand(path: "/tmp/x").contains("stat -L --printf"))
         assert(
             listDirectoryCommand(path: "/home/ubuntu/kero-probe-1788328105")
                 == "find '/home/ubuntu/kero-probe-1788328105' -maxdepth 1 -mindepth 1"
