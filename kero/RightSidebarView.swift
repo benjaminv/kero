@@ -31,6 +31,29 @@ private final class PanelSyncQueue {
     }
 }
 
+/// One ``PortForwardController`` per remote connection, kept while the pane
+/// lives so a forward opened from a port row is still known after the user
+/// switches panels and comes back. The connection is held weakly: its
+/// forwards die with it, so a finished connection's entry is dropped.
+@MainActor
+private final class PortForwardRegistry {
+    private struct Entry {
+        weak var connection: RemoteConnection?
+        let controller: PortForwardController
+    }
+
+    private var entries: [UUID: Entry] = [:]
+
+    func controller(for connection: RemoteConnection?) -> PortForwardController? {
+        entries = entries.filter { $0.value.connection != nil }
+        guard let connection else { return nil }
+        if let existing = entries[connection.id]?.controller { return existing }
+        let controller = PortForwardController(connection: connection)
+        entries[connection.id] = Entry(connection: connection, controller: controller)
+        return controller
+    }
+}
+
 /// Hosts the pane's remote heading, which is AppKit and outlives any one
 /// body evaluation — same shape as the diff viewer's web host.
 private struct RemotePaneHeaderHost: NSViewRepresentable {
@@ -81,6 +104,9 @@ struct RightSidebarView: View {
     /// Mirrors the heading's own state, because the layout above has to give
     /// back the row's height when the session is local.
     @State private var remoteHeaderState = RemotePaneHeaderState.local
+    @State private var portForwards = PortForwardRegistry()
+    /// The selected session's forwards, or nil while it is local.
+    @State private var forwards: PortForwardController?
     @AppStorage("rightSidebarWidth") private var width: Double = 240
 
     private var sidebarFontScale: CGFloat {
@@ -171,7 +197,11 @@ struct RightSidebarView: View {
                             }
                         )
                     case .info:
-                        InfoPanel(model: info, session: manager.selectedSession)
+                        InfoPanel(
+                            model: info,
+                            session: manager.selectedSession,
+                            forwards: forwards
+                        )
                     }
                 }
                 .frame(width: width)
@@ -305,6 +335,8 @@ struct RightSidebarView: View {
             ? nil
             : session.panelDirectoryPath
         if remoteHeaderState != headerState { remoteHeaderState = headerState }
+        let controller = portForwards.controller(for: session.location.remoteConnection)
+        if forwards !== controller { forwards = controller }
 
         let cwd = session.panelDirectoryPath
         let backend = session.workspaceBackend
@@ -2341,6 +2373,9 @@ private struct InfoPanel: View {
     @ObservedObject var model: SessionInfoModel
     @ObservedObject private var themeChanges = Theme.changes
     let session: TerminalSession?
+    /// The remote session's open forwards. Nil while local, where a listening
+    /// port is already reachable on this Mac.
+    var forwards: PortForwardController?
 
     @State private var currentDirectoryCollapsed = false
     @State private var projectDirectoryCollapsed = false
@@ -2490,6 +2525,53 @@ private struct InfoPanel: View {
         .padding(.bottom, 4)
     }
 
+    /// Locally a listening port is already reachable here. On a remote it is
+    /// not, so "open" means forward it to a loopback port first and open that.
+    /// Never automatic: this only runs because someone clicked the row.
+    private func openPort(_ port: SessionInfoModel.PortItem) {
+        guard isRemote else {
+            if let url = port.url { NSWorkspace.shared.open(url) }
+            return
+        }
+        withForwardedURL(port) { NSWorkspace.shared.open($0) }
+    }
+
+    private func copyPortURL(_ port: SessionInfoModel.PortItem) {
+        guard isRemote else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("http://localhost:\(port.port)", forType: .string)
+            return
+        }
+        withForwardedURL(port) { url in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        }
+    }
+
+    /// Forwards `port` if it is not already, then hands over the loopback URL
+    /// it is reachable on. Asking twice reuses the same forward.
+    private func withForwardedURL(
+        _ port: SessionInfoModel.PortItem, then use: @escaping (URL) -> Void
+    ) {
+        guard let forwards else { return }
+        Task {
+            do {
+                let localPort = try await forwards.forward(remotePort: port.port)
+                guard let url = URL(string: "http://127.0.0.1:\(localPort)/") else { return }
+                use(url)
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = String(
+                    localized: "Couldn’t forward port \(port.port).",
+                    comment: "Remote port forward failure. The placeholder is a port number."
+                )
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
+    }
+
     private func copyPath(_ path: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(path, forType: .string)
@@ -2558,9 +2640,16 @@ private struct InfoPanel: View {
                 emptyRow(String(localized: "No listening ports"))
             } else {
                 ForEach(model.ports) { port in
-                    InfoPortRow(port: port) { force in
-                        Task { await model.kill(port.pid, force: force) }
-                    }
+                    InfoPortRow(
+                        port: port,
+                        localPort: forwards?.localPort(forRemote: port.port),
+                        isRemote: isRemote,
+                        open: { openPort(port) },
+                        copyURL: { copyPortURL(port) },
+                        kill: { force in
+                            Task { await model.kill(port.pid, force: force) }
+                        }
+                    )
                 }
             }
         }
@@ -2643,24 +2732,40 @@ private struct InfoProcessRow: View {
 
 private struct InfoPortRow: View {
     let port: SessionInfoModel.PortItem
+    /// The loopback port this remote port is forwarded to, once it is.
+    let localPort: Int?
+    let isRemote: Bool
+    let open: () -> Void
+    let copyURL: () -> Void
     let kill: (_ force: Bool) -> Void
 
     @State private var isHovering = false
 
-    private var urlString: String { "http://localhost:\(port.port)" }
+    /// What clicking the row reaches. A remote port that is not forwarded yet
+    /// has no address to show until it is, so the label says so instead of
+    /// naming one that would not answer.
+    private var urlString: String {
+        if let localPort { return "http://127.0.0.1:\(localPort)" }
+        return isRemote
+            ? String(localized: "Forward this port and open it")
+            : "http://localhost:\(port.port)"
+    }
+
+    /// The port cell: the remote number alone, or both numbers once forwarded,
+    /// so it is clear which machine each belongs to.
+    private var portLabel: String {
+        guard let localPort else { return String(port.port) }
+        return "\(port.port) → \(localPort)"
+    }
 
     var body: some View {
-        Button {
-            if let url = port.url {
-                NSWorkspace.shared.open(url)
-            }
-        } label: {
+        Button(action: open) {
             HStack(spacing: 7) {
-                Image(systemName: "network")
+                Image(systemName: isRemote ? "arrow.left.arrow.right" : "network")
                     .sidebarFont(size: 9, weight: .medium)
                     .foregroundStyle(Color(red: 0.35, green: 0.65, blue: 1.0))
                     .frame(width: 12)
-                Text(String(port.port))
+                Text(portLabel)
                     .sidebarFont(size: 11.5, weight: .medium, design: .monospaced)
                     .foregroundStyle(.secondary)
                     .layoutPriority(1)
@@ -2682,25 +2787,34 @@ private struct InfoPortRow: View {
             .contentShape(RoundedRectangle(cornerRadius: 4))
         }
         .buttonStyle(.plain)
-        .help("Open \(urlString)")
+        .help(helpText)
         .background(
             RoundedRectangle(cornerRadius: 4)
                 .fill(isHovering ? Color.primary.opacity(0.05) : .clear)
         )
         .onHover { isHovering = $0 }
         .contextMenu {
-            Button("Open in Browser") {
-                if let url = port.url {
-                    NSWorkspace.shared.open(url)
-                }
+            Button(isRemote && localPort == nil ? "Forward and Open" : "Open in Browser") {
+                open()
             }
-            Button("Copy URL") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(urlString, forType: .string)
-            }
+            Button("Copy URL") { copyURL() }
             Divider()
             Button("Kill Process (\(port.processName))") { kill(false) }
         }
+    }
+
+    private var helpText: String {
+        guard isRemote else { return String(localized: "Open \(urlString)") }
+        guard let localPort else {
+            return String(
+                localized: "Forward remote port \(port.port) to this Mac and open it",
+                comment: "Port row tooltip on a remote session. The placeholder is a port number."
+            )
+        }
+        return String(
+            localized: "Remote port \(port.port), open at http://127.0.0.1:\(localPort)/",
+            comment: "Port row tooltip once forwarded. The placeholders are the remote and local port numbers."
+        )
     }
 }
 
