@@ -457,7 +457,10 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         if location.remoteConnection != nil {
             return RemotePaneHeaderView.headerState(for: location)
         }
-        return isRunningUnmanagedSSH ? .unmanaged : .local
+        guard isRunningUnmanagedSSH else { return .local }
+        // Two opposite situations: the user deliberately ran their own ssh
+        // client, or Kero's integration was active and silently did not take.
+        return sshHelperWasBypassed ? .helperBypassed : .unmanaged
     }
 
     /// True when the foreground job is an ssh client Kero is not in front of.
