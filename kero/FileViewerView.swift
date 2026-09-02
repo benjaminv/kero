@@ -66,16 +66,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// follows the session onto another machine — and re-binds to a new
     /// connection to the same machine when one arrives.
     private var backend: WorkspaceBackend
-    /// The session this file was opened from, watched for its workspace going
-    /// away. Weak: closing the terminal must not keep it alive.
-    private weak var session: TerminalSession?
     /// The workspace this file belongs to: nil for this Mac, else the machine
     /// it was opened from. Part of the tab's identity, so the same path on two
     /// machines is two tabs, and a file opened locally is never read-only.
     let workspaceIdentity: String?
-    private var locationObservation: AnyCancellable?
-    private var stateObservation: AnyCancellable?
-    private var directoryObservation: AnyCancellable?
 
     private struct LoadedContent {
         let content: Content
@@ -89,7 +83,6 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         backend: WorkspaceBackend? = nil
     ) {
         self.path = path
-        self.session = session
         // Files opened from a remote session keep reading and writing over
         // that connection even while the panels follow another session.
         let backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
@@ -108,58 +101,28 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         if case .loading = content {
             reloadFromDiskIfClean()
         }
-        if let session, let workspaceIdentity {
-            observeWorkspace(of: session, destination: workspaceIdentity)
-        }
     }
 
     // MARK: - Remote workspace
 
-    private func observeWorkspace(of session: TerminalSession, destination: String) {
-        locationObservation = session.$location.sink { [weak self] location in
-            self?.follow(location, destination: destination)
-        }
-    }
-
-    /// A dropped connection makes the file read-only; a fresh connection to
-    /// the same machine makes it writable again. Anything short of
-    /// `.connected` counts as read-only, so the banner stays up while a
-    /// reconnecting ssh is still asking for credentials.
-    private func follow(_ location: WorkspaceLocation, destination: String) {
-        guard let connection = location.remoteConnection,
-              connection.workspaceIdentity == destination
-        else {
-            stateObservation = nil
-            directoryObservation = nil
-            setReadOnly(true, destination: destination)
+    /// Re-checks this tab against the project's connections: adopts a live
+    /// workspace for its own machine, or marks it read-only. Driven by the
+    /// project rather than by the session the tab was opened from, because a
+    /// user who reconnects in another terminal of the same project is
+    /// reconnecting to the same machine.
+    func reevaluateWorkspace(in project: Project) {
+        guard let workspaceIdentity else { return }
+        guard let live = project.connectedWorkspace(for: workspaceIdentity) else {
+            setReadOnly(true, destination: workspaceIdentity)
             return
         }
-        // The session reports a remote workspace only once the connection is
-        // connected *and* its directory has been discovered, so the file
-        // becomes reachable on either of those changing.
-        stateObservation = connection.$state.sink { [weak self] _ in
-            self?.followReachability(destination: destination)
-        }
-        directoryObservation = connection.$workingDirectory.sink { [weak self] _ in
-            self?.followReachability(destination: destination)
-        }
-    }
-
-    /// Adopts a live connection to this file's own machine, or marks the file
-    /// read-only. Re-binding matters as much as the banner: a reconnection is
-    /// a new channel, and reading or saving over the dead one fails.
-    private func followReachability(destination: String) {
-        guard let session,
-              let connection = session.location.remoteConnection,
-              connection.workspaceIdentity == destination,
-              connection.state == .connected,
-              !(session.workspaceBackend is LocalWorkspaceBackend)
-        else {
-            setReadOnly(true, destination: destination)
-            return
-        }
-        backend = session.workspaceBackend
-        setReadOnly(false, destination: destination)
+        guard readOnlyReason != nil else { return }
+        // A reconnection is a new channel; reading or saving over the old one
+        // fails, so the tab takes the live one.
+        backend = live
+        readOnlyReason = nil
+        // No-op while the buffer is dirty, so edits made during the outage
+        // survive and can now be saved.
         reloadFromDiskIfClean()
     }
 

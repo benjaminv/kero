@@ -38,6 +38,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// because every way of reaching a tab — strip click, Ctrl-number,
     /// opening a file — counts as a use.
     private var recentTabIDs: [UUID] = []
+    private var isRemoteTabRebindPending = false
 
     private let fallbackName: String
     /// Sessions publish their own changes (title, directory); re-publish them
@@ -268,8 +269,54 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         }
         sessionObservations[session.id] = session.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+            // A session's connection coming or going decides whether the
+            // project's remote tabs can be read and written.
+            self?.scheduleRemoteTabRebind()
         }
         return session
+    }
+
+    // MARK: - Remote tabs
+
+    /// A live workspace for `identity`, from whichever session in this project
+    /// holds it. A file belongs to a machine, not to the terminal it happened
+    /// to be opened from: reconnecting in a second terminal of the same
+    /// project makes those tabs writable again.
+    func connectedWorkspace(for identity: String) -> WorkspaceBackend? {
+        for session in sessions {
+            guard let connection = session.location.remoteConnection,
+                  connection.workspaceIdentity == identity,
+                  connection.state == .connected
+            else { continue }
+            let backend = session.workspaceBackend
+            // The session reports a remote workspace only once the connection
+            // is connected and its directory is known; until then it is still
+            // answering with the local disk, which is not this file's machine.
+            if !(backend is LocalWorkspaceBackend) { return backend }
+        }
+        return nil
+    }
+
+    /// Re-checks every remote file and diff against the project's connections.
+    /// Observations arrive before the change lands, so this runs one hop later
+    /// and at most once per turn.
+    private func scheduleRemoteTabRebind() {
+        guard !isRemoteTabRebindPending else { return }
+        isRemoteTabRebindPending = true
+        Task { @MainActor in
+            isRemoteTabRebindPending = false
+            rebindRemoteTabs()
+        }
+    }
+
+    func rebindRemoteTabs() {
+        for content in tabs.flatMap(\.allContents) {
+            switch content {
+            case .file(let file): file.reevaluateWorkspace(in: self)
+            case .diff(let diff): diff.reevaluateWorkspace(in: self)
+            case .session, .browser: break
+            }
+        }
     }
 
     func terminateAll() {
