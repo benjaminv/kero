@@ -31,6 +31,37 @@ private final class PanelSyncQueue {
     }
 }
 
+/// Hosts the pane's remote heading, which is AppKit and outlives any one
+/// body evaluation — same shape as the diff viewer's web host.
+private struct RemotePaneHeaderHost: NSViewRepresentable {
+    let view: RemotePaneHeaderView
+    let fontScale: CGFloat
+
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView()
+        attach(to: container)
+        return container
+    }
+
+    func updateNSView(_ container: NSView, context: Context) {
+        if view.superview !== container {
+            attach(to: container)
+        }
+        view.fontScale = fontScale
+    }
+
+    private func attach(to container: NSView) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+    }
+}
+
 /// Right sidebar: hidden by default, toggled from the terminal's corner
 /// button or ⇧⌘B. Files/Git switch via tabs along its top, otty-style.
 struct RightSidebarView: View {
@@ -44,7 +75,17 @@ struct RightSidebarView: View {
     /// Which rule produced the current panel root; drives the Files badge.
     @State private var rootSource = Project.PanelRootSource.shell
     @State private var syncQueue = PanelSyncQueue()
+    /// The remote heading. Held here rather than rebuilt, so its state and
+    /// its lamp survive every panel switch and poll.
+    @State private var remoteHeader = RemotePaneHeaderView(frame: .zero)
+    /// Mirrors the heading's own state, because the layout above has to give
+    /// back the row's height when the session is local.
+    @State private var remoteHeaderState = RemotePaneHeaderState.local
     @AppStorage("rightSidebarWidth") private var width: Double = 240
+
+    private var sidebarFontScale: CGFloat {
+        CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
+    }
 
     private var pollsSelectedPanel: Bool {
         manager.isPanelVisible
@@ -81,6 +122,15 @@ struct RightSidebarView: View {
 
                 VStack(spacing: 0) {
                     tabBar
+                    if remoteHeaderState != .local {
+                        RemotePaneHeaderHost(
+                            view: remoteHeader,
+                            fontScale: sidebarFontScale
+                        )
+                        .frame(height: remoteHeader.fittingSize.height)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 6)
+                    }
                     switch manager.panelTab {
                     case .files:
                         FileTreePanel(
@@ -176,10 +226,7 @@ struct RightSidebarView: View {
         .onChange(of: manager.selectedSession?.workingDirectory) { syncModels() }
         // Same for pinning/unpinning the project directory.
         .onChange(of: manager.selectedProject?.customDirectory) { syncModels() }
-        .environment(
-            \.sidebarFontScale,
-            CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
-        )
+        .environment(\.sidebarFontScale, sidebarFontScale)
         // Native button and control labels without a designed hierarchy use
         // the configured base size directly.
         .environment(\.font, .system(size: CGFloat(settings.sidebarFontSize)))
@@ -249,6 +296,16 @@ struct RightSidebarView: View {
         // The panel path, not the session's own: once the session is on a
         // remote machine these panels follow the remote shell's directory,
         // while new local terminals and restore snapshots keep the local one.
+        // What the heading says is a fact about the terminal, not about any
+        // connection: an ssh Kero is not in front of has no connection at all
+        // and still has to be reported.
+        let headerState = session.remoteHeaderState
+        remoteHeader.apply(state: headerState)
+        remoteHeader.workingDirectory = headerState == .local
+            ? nil
+            : session.panelDirectoryPath
+        if remoteHeaderState != headerState { remoteHeaderState = headerState }
+
         let cwd = session.panelDirectoryPath
         let backend = session.workspaceBackend
         // Files and Git anchor to the project directory — pinned when the
