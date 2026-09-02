@@ -59,6 +59,10 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// ssh directly means the integration did not take, which the pane says
     /// out loud rather than leaving the user to wonder.
     private let zshIntegrationActive: Bool
+    /// When the current foreground ssh was first seen. A remote command like
+    /// `ssh host uptime` is a foreground ssh too, and it finishes in well under
+    /// a second; announcing it would flash the pane for no reason.
+    private var unmanagedSSHFirstSeen: (pid: pid_t, at: Date)?
     private var remoteMonitor: Task<Void, Never>?
     private var remoteObservation: AnyCancellable?
     private var lastHistorySnapshot: String?
@@ -457,37 +461,52 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// channel to work over. Saying so is better than showing this Mac's files
     /// under the remote's name.
     var remoteHeaderState: RemotePaneHeaderState {
+        // A connection of Kero's own always describes itself, whatever is in
+        // the foreground.
         if location.remoteConnection != nil {
+            unmanagedSSHFirstSeen = nil
             return RemotePaneHeaderView.headerState(for: location)
         }
-        guard isRunningUnmanagedSSH else { return .local }
+        guard let foreground = unmanagedSSH?.pid else {
+            unmanagedSSHFirstSeen = nil
+            return .local
+        }
+        // Only speak up once this ssh has held the foreground across two
+        // refreshes. Anything shorter is a command, not a session.
+        if let seen = unmanagedSSHFirstSeen, seen.pid == foreground {
+            guard Date().timeIntervalSince(seen.at) >= Self.unmanagedSSHGrace else {
+                return .local
+            }
+        } else {
+            unmanagedSSHFirstSeen = (foreground, Date())
+            return .local
+        }
         // Two opposite situations: the user deliberately ran their own ssh
         // client, or Kero's integration was active and silently did not take.
         return sshHelperWasBypassed ? .helperBypassed : .unmanaged
     }
 
+    /// Two panel refreshes at the existing 2 s cadence.
+    private static let unmanagedSSHGrace: TimeInterval = 2
+
     /// True when the foreground job is an ssh client Kero is not in front of.
     /// The kernel-reported image is used rather than the tab title, which is
     /// terminal output the remote can write.
-    private var isRunningUnmanagedSSH: Bool {
-        unmanagedSSHExecutablePath != nil
-    }
-
-    /// Executable of a foreground ssh that did not come through Kero.
-    private var unmanagedSSHExecutablePath: String? {
+    /// A foreground ssh that did not come through Kero, with its executable.
+    private var unmanagedSSH: (pid: pid_t, path: String)? {
         guard let foreground = surface.foregroundPid, foreground > 0,
               foreground != shellPid,
               let path = processExecutablePath(pid: foreground),
               (path as NSString).lastPathComponent == "ssh"
         else { return nil }
-        return path
+        return (foreground, path)
     }
 
     /// True when this session had Kero's zsh integration and a stock ssh ran
     /// anyway. The integration is meant to make that impossible, so saying so
     /// turns a silent failure into a visible one.
     var sshHelperWasBypassed: Bool {
-        zshIntegrationActive && unmanagedSSHExecutablePath == "/usr/bin/ssh"
+        zshIntegrationActive && unmanagedSSH?.path == "/usr/bin/ssh"
     }
 
     /// The shell the right pane should describe: the remote login shell while
