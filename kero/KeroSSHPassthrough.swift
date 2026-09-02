@@ -172,17 +172,20 @@ enum KeroSSHPassthrough {
                     : .notFollowable
             }
 
-            var characters = Array(argument.dropFirst())
+            let characters = Array(argument.dropFirst())
             var cursor = 0
             while cursor < characters.count {
                 let flag = characters[cursor]
                 if disqualifyingFlags.contains(flag) { return .notFollowable }
+                // Checked before the flag branch: `-M` takes no value and so
+                // also appears in the flag set, but it still means the user is
+                // running their own multiplexing master.
+                if disqualifyingValueOptions.contains(flag) { return .notFollowable }
                 if flagOptions.contains(flag) {
                     cursor += 1
                     continue
                 }
-                if valueOptions.contains(flag) || disqualifyingValueOptions.contains(flag) {
-                    if disqualifyingValueOptions.contains(flag) { return .notFollowable }
+                if valueOptions.contains(flag) {
                     let attached = String(characters[(cursor + 1)...])
                     if attached.isEmpty {
                         // The value is the next argument, so skip it.
