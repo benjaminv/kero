@@ -18,7 +18,17 @@ enum RemotePaneHeaderState: Equatable {
     /// An ssh process is in the foreground but Kero is not in front of it, so
     /// the remote tools cannot be offered. Showing local paths under a remote
     /// heading would be worse than saying nothing works.
+    ///
+    /// Deliberately a case of its own rather than a flag on ``unmanaged``: the
+    /// two read the same to a user but mean opposite things to us. This one is
+    /// the user's own choice - a raw `/usr/bin/ssh`, or an ssh from inside a
+    /// remote shell - and nothing is wrong.
     case unmanaged
+    /// The session started with Kero's shell integration and a stock ssh ran
+    /// anyway, so the integration silently did not take. Worth distinguishing
+    /// from ``unmanaged`` because this one is a fault on our side, and the
+    /// heading is the only place it becomes visible.
+    case helperBypassed
 }
 
 /// The right pane's remote heading: `user@host` with a lamp while connected,
@@ -183,13 +193,19 @@ final class RemotePaneHeaderView: NSView {
                 localized: "Remote tools unavailable - connection not managed by Kero",
                 comment: "Right pane header when an ssh session was started in a way Kero cannot follow."
             )
+        case .helperBypassed:
+            return String(
+                localized: "Remote tools unavailable - Kero's ssh helper was not used",
+                comment: "Right pane header when Kero's shell integration is active but a stock ssh ran anyway, so the integration did not take effect."
+            )
         }
     }
 
     /// The full destination, which the heading itself may have truncated.
     private static func tooltip(for state: RemotePaneHeaderState) -> String? {
         switch state {
-        case .local, .unmanaged: return title(for: state).isEmpty ? nil : title(for: state)
+        case .local, .unmanaged, .helperBypassed:
+            return title(for: state).isEmpty ? nil : title(for: state)
         case .connected(let destination),
             .connecting(let destination),
             .disconnected(let destination):
