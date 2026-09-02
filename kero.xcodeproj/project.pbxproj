@@ -98,6 +98,7 @@
 				FF3FDD6F300B6A7400112486 /* Sources */,
 				FF3FDD70300B6A7400112486 /* Frameworks */,
 				FF3FDD71300B6A7400112486 /* Resources */,
+				AA40000000000000000000A1 /* Install ssh helper symlink */,
 			);
 			buildRules = (
 			);
@@ -193,6 +194,18 @@
 				"\"${SRCROOT}/scripts/build-alacritty-bridge.sh\"",
 				"",
 			);
+		};
+		AA40000000000000000000A1 /* Install ssh helper symlink */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			inputPaths = (
+			);
+			name = "Install ssh helper symlink";
+			outputPaths = (
+				"$(CODESIGNING_FOLDER_PATH)/Contents/MacOS/ssh",
+			);
+			shellPath = /bin/sh;
+			shellScript = "# Kero prepends Contents/MacOS to every terminal's PATH, so a symlink\n# named ssh beside the app binary is what puts Kero in front of a typed\n# ssh. Relative target: the link must stay valid wherever the bundle goes.\nset -e\nln -sfn kero \"${CODESIGNING_FOLDER_PATH}/Contents/MacOS/ssh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
