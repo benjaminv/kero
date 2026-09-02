@@ -246,7 +246,10 @@ struct RightSidebarView: View {
               let project = manager.selectedProject,
               let session = project.selectedSession
         else { return }
-        let cwd = session.currentDirectoryPath
+        // The panel path, not the session's own: once the session is on a
+        // remote machine these panels follow the remote shell's directory,
+        // while new local terminals and restore snapshots keep the local one.
+        let cwd = session.panelDirectoryPath
         let backend = session.workspaceBackend
         // Files and Git anchor to the project directory — pinned when the
         // user set one, else the repository the session is working in — so
