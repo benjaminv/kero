@@ -50,7 +50,7 @@ enum RemoteConnectionError: Error, LocalizedError {
 /// typed. Kero never authenticates: the control socket is created by that
 /// process, and every command here rides the existing channel.
 @MainActor
-final class RemoteConnection: ObservableObject, Identifiable {
+final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunner {
     enum State: Equatable {
         case connecting
         case connected
@@ -160,7 +160,7 @@ final class RemoteConnection: ObservableObject, Identifiable {
     // MARK: - Multiplex commands
 
     /// `ssh -S <socket> -O check <destination>`: does the master still answer?
-    func check() async -> Bool {
+    nonisolated func check() async -> Bool {
         let result = await Self.runSSH(
             arguments: controlArguments + ["-O", "check", destination],
             stdin: nil,
@@ -254,34 +254,54 @@ final class RemoteConnection: ObservableObject, Identifiable {
 
     /// Runs one command on the remote over the shared channel.
     ///
+    /// `argv` is handed to ssh as the remote command words, which ssh joins
+    /// with spaces for the remote login shell to interpret. Callers that have
+    /// already built a shell command pass it as a single element; callers with
+    /// real argv should quote through ``remoteScript(_:cwd:)`` first.
+    ///
     /// The liveness check is not decoration: with a dead control socket `ssh
     /// -S` silently falls back to opening a brand new connection, which would
     /// authenticate behind the user's back. Checking first keeps this method
     /// strictly a passenger on the session the user opened.
-    @discardableResult
-    func run(
+    nonisolated func run(
         _ argv: [String],
-        cwd: String? = nil,
         stdin: Data? = nil,
         timeout: TimeInterval = 20
     ) async throws -> (status: Int32, stdout: Data, stderr: Data) {
-        guard state == .connected else { throw RemoteConnectionError.notConnected }
-        guard await check() else {
-            markDisconnected(reason: "control socket check failed")
+        let ready = await MainActor.run { state == .connected }
+        guard ready, await check() else {
+            await MainActor.run {
+                if state == .connected {
+                    markDisconnected(reason: "control socket check failed")
+                }
+            }
             throw RemoteConnectionError.notConnected
         }
-        let result = await Self.runSSH(
-            arguments: controlArguments
-                + ["-o", "BatchMode=yes", destination, "--", Self.remoteScript(argv, cwd: cwd)],
+        return await Self.runSSH(
+            arguments: controlArguments + ["-o", "BatchMode=yes", destination, "--"] + argv,
             stdin: stdin,
             timeout: timeout
         )
-        return result
+    }
+
+    /// Runs a command in a specific remote directory. Every element is quoted
+    /// here, so this is the entry point for real argv rather than a shell
+    /// command that has already been assembled.
+    @discardableResult
+    func run(
+        _ argv: [String],
+        cwd: String,
+        stdin: Data? = nil,
+        timeout: TimeInterval = 20
+    ) async throws -> (status: Int32, stdout: Data, stderr: Data) {
+        try await run(
+            [Self.remoteScript(argv, cwd: cwd)], stdin: stdin, timeout: timeout
+        )
     }
 
     /// Options naming the shared channel. `-S` is ssh's own "use this control
     /// socket" switch and overrides any ControlPath from a config file.
-    private var controlArguments: [String] {
+    nonisolated private var controlArguments: [String] {
         ["-S", controlSocket.path, "-p", String(port)]
     }
 
