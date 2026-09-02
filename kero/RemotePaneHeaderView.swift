@@ -31,11 +31,24 @@ final class RemotePaneHeaderView: NSView {
         static let lamp: CGFloat = 6
         static let gap: CGFloat = 5
         static let titleSize: CGFloat = 12
+        static let subtitleSize: CGFloat = 10
+        static let titleToSubtitle: CGFloat = 1
     }
 
     private let lamp = NSView(frame: .zero)
     private let label = NSTextField(labelWithString: "")
+    private let subtitle = NSTextField(labelWithString: "")
     private var lampWidth: NSLayoutConstraint?
+
+    /// The directory the remote session is in, shown under the destination the
+    /// way the panel headings show their path. Hidden while it is unknown,
+    /// which it is until the working-directory probe has answered once.
+    var workingDirectory: String? {
+        didSet {
+            guard workingDirectory != oldValue else { return }
+            applyWorkingDirectory()
+        }
+    }
 
     /// Matches the sidebar's font scaling, so this heading grows with the
     /// panel titles beneath it rather than staying a fixed size.
@@ -63,8 +76,16 @@ final class RemotePaneHeaderView: NSView {
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         applyFont()
 
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.textColor = .secondaryLabelColor
+        // Truncating the head keeps the leaf directory visible, which is the
+        // part that changes as the session moves around.
+        subtitle.lineBreakMode = .byTruncatingHead
+        subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         addSubview(lamp)
         addSubview(label)
+        addSubview(subtitle)
 
         let width = lamp.widthAnchor.constraint(equalToConstant: Metrics.lamp)
         lampWidth = width
@@ -78,10 +99,16 @@ final class RemotePaneHeaderView: NSView {
                 equalTo: lamp.trailingAnchor, constant: Metrics.gap),
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
             label.topAnchor.constraint(equalTo: topAnchor),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            subtitle.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            subtitle.topAnchor.constraint(
+                equalTo: label.bottomAnchor, constant: Metrics.titleToSubtitle),
+            subtitle.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
         apply(state: .local)
+        applyWorkingDirectory()
     }
 
     @available(*, unavailable)
@@ -107,6 +134,7 @@ final class RemotePaneHeaderView: NSView {
         lamp.isHidden = !showsLamp
         lamp.layer?.backgroundColor = NSColor.systemGreen.cgColor
         lampWidth?.constant = showsLamp ? Metrics.lamp : 0
+        applyWorkingDirectory()
     }
 
     /// The state a `WorkspaceLocation` implies. `unmanaged` never comes from
@@ -174,9 +202,18 @@ final class RemotePaneHeaderView: NSView {
         return false
     }
 
+    /// Only meaningful next to a destination, so it goes away with the states
+    /// that have no directory to speak of.
+    private func applyWorkingDirectory() {
+        let path = workingDirectory ?? ""
+        subtitle.stringValue = path
+        subtitle.isHidden = path.isEmpty || !Self.isProminent(state)
+    }
+
     private func applyFont() {
         label.font = .systemFont(
             ofSize: Metrics.titleSize * fontScale, weight: .semibold
         )
+        subtitle.font = .systemFont(ofSize: Metrics.subtitleSize * fontScale)
     }
 }
