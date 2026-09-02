@@ -152,8 +152,14 @@ nonisolated enum RemoteCommands {
     /// both are needed because a symlinked directory has to report as a
     /// directory *and* as a symlink, matching the local backend. NUL
     /// separators keep newlines in filenames from splitting a record.
+    ///
+    /// `-H` follows the starting point, and only the starting point. Without
+    /// it, listing a symlink that points at a directory returns nothing at all
+    /// and the file tree shows an empty folder that will not expand, where the
+    /// local backend follows it. Entries below are unaffected, so a symlink
+    /// inside the directory still reports as a symlink.
     static func listDirectoryCommand(path: String) -> String {
-        "find \(quote(path)) -maxdepth 1 -mindepth 1 -printf '%y\\t%Y\\t%f\\0'"
+        "find -H \(quote(path)) -maxdepth 1 -mindepth 1 -printf '%y\\t%Y\\t%f\\0'"
     }
 
     static func parseDirectoryListing(_ output: Data) -> [WorkspaceEntry] {
@@ -405,10 +411,12 @@ extension RemoteCommands {
 
         assert(statCommand(path: "/tmp/x").contains("stat --printf '%F\\t%s\\t%Y\\t%a\\n' -- '/tmp/x'"))
         assert(statCommand(path: "/tmp/x").contains("stat -L --printf"))
+        // `-H` is load-bearing: without it a symlinked directory lists as empty.
         assert(
             listDirectoryCommand(path: "/home/ubuntu/kero-probe-1788328105")
-                == "find '/home/ubuntu/kero-probe-1788328105' -maxdepth 1 -mindepth 1"
+                == "find -H '/home/ubuntu/kero-probe-1788328105' -maxdepth 1 -mindepth 1"
                 + " -printf '%y\\t%Y\\t%f\\0'")
+        assert(listDirectoryCommand(path: "/tmp/sub-link").hasPrefix("find -H "))
         let listing = Data(
             "f\tf\tscript.sh\0d\td\tsub\0l\td\tlink-to-sub\0l\tL\tbroken\0".utf8)
         let entries = parseDirectoryListing(listing)
