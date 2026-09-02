@@ -29,6 +29,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// reconciles foreground process identity with explicit lifecycle events.
     @Published var agentStatus: KeroAgentStatus?
 
+    /// Where this session's right pane looks. Set by Kero's `ssh` helper
+    /// through the automation socket, never guessed from the foreground
+    /// process: an ssh Kero did not front cannot be followed.
+    @Published var location: WorkspaceLocation = .local
+
     /// The emulator driving this session. Fixed for the session's lifetime —
     /// changing the setting only affects terminals opened afterwards.
     let backend: TerminalBackend
@@ -45,6 +50,8 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     private let launchDirectoryURL: URL?
     private let shellPidFileURL: URL?
     private var cachedShellPid: pid_t?
+    private var remoteMonitor: Task<Void, Never>?
+    private var remoteObservation: AnyCancellable?
     private var lastHistorySnapshot: String?
     private var isTerminating = false
     private var commandExecutionStartedAtNanos: UInt64?
@@ -197,9 +204,74 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     }
 
     private func removeLaunchArtifacts() {
+        endRemoteConnection(reason: "terminal closed")
         KeroCLIService.shared.revokeTerminal(id: id)
         guard let launchDirectoryURL else { return }
         try? FileManager.default.removeItem(at: launchDirectoryURL)
+    }
+
+    // MARK: - Remote workspace
+
+    /// Adopts the connection Kero's `ssh` helper just announced and starts
+    /// watching it. Exactly one connection per session: an `ssh` typed from
+    /// inside an already-remote shell is nested and is not followed.
+    func beginRemoteConnection(_ connection: RemoteConnection) {
+        guard location.remoteConnection == nil else {
+            NSLog(
+                "kero: ignoring nested ssh in terminal %@ (already remote)",
+                id.uuidString
+            )
+            return
+        }
+        location = .remote(connection)
+        // The connection is its own observable object, so republish its
+        // changes or views bound to the session never see a state change.
+        remoteObservation = connection.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        remoteMonitor = Task { [weak self] in
+            await self?.watchRemoteConnection(connection)
+        }
+    }
+
+    func endRemoteConnection(reason: String) {
+        remoteMonitor?.cancel()
+        remoteMonitor = nil
+        remoteObservation = nil
+        location.remoteConnection?.markDisconnected(reason: reason)
+    }
+
+    /// One check a second. While connecting, only the ssh process going away
+    /// is a failure: the control socket does not exist until authentication
+    /// finishes, and a password or a hardware key can take a while.
+    private func watchRemoteConnection(_ connection: RemoteConnection) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if Task.isCancelled { return }
+
+            guard connection.isSSHProcessAlive else {
+                connection.markDisconnected(reason: "ssh process exited")
+                return
+            }
+            switch connection.state {
+            case .connecting:
+                guard connection.controlSocketExists else { continue }
+                if await connection.check() { connection.markConnected() }
+            case .connected:
+                // The master removes its socket on exit, so this is both
+                // cheaper and faster than waiting for a check to fail.
+                guard connection.controlSocketExists else {
+                    connection.markDisconnected(reason: "control socket removed")
+                    return
+                }
+                if await connection.check() == false {
+                    connection.markDisconnected(reason: "control socket check failed")
+                    return
+                }
+            case .disconnected:
+                return
+            }
+        }
     }
 
     /// Short label for the sidebar: the tail of the current directory, if known.

@@ -97,6 +97,9 @@ enum KeroAutomationRouter {
         case "agent.report":
             return reportAgent(request, caller: caller)
 
+        case "remote.connecting":
+            return beginRemoteConnection(request, caller: caller)
+
         default:
             return failure(
                 request, "method_not_found",
@@ -381,6 +384,53 @@ enum KeroAutomationRouter {
             )
         }
         return success(request, paneSnapshot(caller, caller: caller))
+    }
+
+    /// Kero's own `ssh` helper reporting that this terminal is about to go
+    /// remote. Kero allocates the control socket rather than the helper: the
+    /// path is keyed to the app process, and `sockaddr_un` caps it at 104
+    /// bytes, so the side that owns the directory owns the name.
+    private static func beginRemoteConnection(
+        _ request: KeroAutomationRequest,
+        caller: PaneContext
+    ) -> KeroAutomationResponse {
+        guard let session = caller.session else {
+            return failure(request, "terminal_required", "The caller is not a terminal pane.")
+        }
+        guard let host = request.params["host"]?.stringValue, !host.isEmpty,
+              let pid = request.params["pid"]?.intValue, pid > 1
+        else {
+            return failure(
+                request, "invalid_params",
+                "host must be a non-empty string and pid a live process id."
+            )
+        }
+        let user = request.params["user"]?.stringValue ?? ""
+        let port = request.params["port"]?.intValue ?? 22
+        guard port > 0, port <= 65_535 else {
+            return failure(request, "invalid_params", "port must be between 1 and 65535.")
+        }
+
+        let socket: URL
+        do {
+            socket = try RemoteConnection.allocateControlSocket()
+        } catch {
+            return failure(
+                request, "socket_unavailable",
+                "Could not allocate a control socket: \(error.localizedDescription)"
+            )
+        }
+
+        session.beginRemoteConnection(
+            RemoteConnection(
+                user: user,
+                host: host,
+                port: port,
+                controlSocket: socket,
+                sshPID: pid_t(pid)
+            )
+        )
+        return success(request, .object(["socket": .string(socket.path)]))
     }
 
     private static func targetPane(
