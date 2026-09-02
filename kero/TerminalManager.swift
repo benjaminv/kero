@@ -901,28 +901,33 @@ final class TerminalManager: nonisolated ObservableObject {
             projects: projects.compactMap { project in
                 guard !project.tabs.isEmpty else { return nil }
                 let projectSessions = project.sessions
-                let tabs = project.tabs.map { tab -> ProjectSnapshot.TabSnapshot in
-                    let layout = Self.layoutSnapshot(
+                // A tab holding nothing but remote content is not written at
+                // all, so the surviving tabs decide the selected index below.
+                let savedTabs = project.tabs.compactMap { tab -> (PaneTab, ProjectSnapshot.TabSnapshot)? in
+                    guard let layout = Self.layoutSnapshot(
                         tab.layout,
                         captureTerminalHistory: captureTerminalHistory,
                         histories: &histories
-                    )
-                    let focusedPaneIndex = tab.allPanes.firstIndex {
-                        $0.id == tab.focusedPaneID
-                    } ?? 0
-                    return ProjectSnapshot.TabSnapshot(
+                    ) else { return nil }
+                    // Restore rebuilds panes from the layout that was written,
+                    // so focus is an index into the panes that survived it.
+                    let focusedPaneIndex = tab.allPanes
+                        .filter { Self.isSnapshotable($0.content) }
+                        .firstIndex { $0.id == tab.focusedPaneID } ?? 0
+                    return (tab, ProjectSnapshot.TabSnapshot(
                         layout: layout, focusedPaneIndex: focusedPaneIndex,
                         customName: tab.customName,
                         contextSessionIndex: tab.contextSession.flatMap { context in
                             projectSessions.firstIndex { $0.id == context.id }
                         }
-                    )
+                    ))
                 }
+                let tabs = savedTabs.map(\.1)
                 return ProjectSnapshot(
                     customName: project.customName,
                     customDirectory: project.customDirectory,
                     tabs: tabs,
-                    selectedTabIndex: project.tabs.firstIndex { $0.id == project.selectedTabID }
+                    selectedTabIndex: savedTabs.firstIndex { $0.0.id == project.selectedTabID }
                 )
             },
             selectedProjectIndex: projects.firstIndex { $0.id == selectedProjectID },
@@ -933,14 +938,19 @@ final class TerminalManager: nonisolated ObservableObject {
         return (snapshot, histories)
     }
 
+    /// Nil for a pane, or a whole split, that holds nothing worth restoring —
+    /// today only remote files and diffs, which must not come back as local
+    /// paths. A split that loses one side collapses to the other, so the
+    /// surviving pane takes the whole rectangle.
     private static func layoutSnapshot(
         _ layout: PaneNode,
         captureTerminalHistory: Bool,
         histories: inout [String: String]
-    ) -> SessionSnapshot.ProjectSnapshot.LayoutSnapshot {
+    ) -> SessionSnapshot.ProjectSnapshot.LayoutSnapshot? {
         typealias ProjectSnapshot = SessionSnapshot.ProjectSnapshot
         switch layout {
         case .pane(let pane):
+            guard let content = contentSnapshot(pane.content) else { return nil }
             var historyKey: String?
             if case .session(let session) = pane.content,
                let history = session.serializedHistory(
@@ -951,31 +961,52 @@ final class TerminalManager: nonisolated ObservableObject {
                 historyKey = key
             }
             return .pane(ProjectSnapshot.PaneSnapshot(
-                content: contentSnapshot(pane.content),
+                content: content,
                 weight: 1,
                 historyKey: historyKey
             ))
         case .split(let split):
-            return .split(
-                axis: split.axis,
-                fraction: Double(split.fraction),
-                first: layoutSnapshot(
-                    split.first,
-                    captureTerminalHistory: captureTerminalHistory,
-                    histories: &histories
-                ),
-                second: layoutSnapshot(
-                    split.second,
-                    captureTerminalHistory: captureTerminalHistory,
-                    histories: &histories
-                )
+            let first = layoutSnapshot(
+                split.first,
+                captureTerminalHistory: captureTerminalHistory,
+                histories: &histories
             )
+            let second = layoutSnapshot(
+                split.second,
+                captureTerminalHistory: captureTerminalHistory,
+                histories: &histories
+            )
+            switch (first, second) {
+            case (nil, nil):
+                return nil
+            case (let onlyOne?, nil), (nil, let onlyOne?):
+                return onlyOne
+            case (let first?, let second?):
+                return .split(
+                    axis: split.axis,
+                    fraction: Double(split.fraction),
+                    first: first,
+                    second: second
+                )
+            }
+        }
+    }
+
+    /// Whether this content survives a relaunch. A remote file or diff does
+    /// not: the snapshot records a bare path, so restoring one would reopen
+    /// whatever sits at that path on this Mac.
+    private static func isSnapshotable(_ content: PaneContent) -> Bool {
+        switch content {
+        case .file(let file): return file.workspaceIdentity == nil
+        case .diff(let diff): return diff.workspaceIdentity == nil
+        case .session, .browser: return true
         }
     }
 
     private static func contentSnapshot(
         _ content: PaneContent
-    ) -> SessionSnapshot.ProjectSnapshot.PaneContentSnapshot {
+    ) -> SessionSnapshot.ProjectSnapshot.PaneContentSnapshot? {
+        guard isSnapshotable(content) else { return nil }
         switch content {
         case .session(let session):
             return .session(workingDirectory: session.currentDirectoryPath)
