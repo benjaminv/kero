@@ -439,6 +439,30 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         return directory
     }
 
+    /// What the right pane's heading should say for this session.
+    ///
+    /// The `unmanaged` case is the one Kero cannot serve: an ssh is running in
+    /// the foreground but it did not come through Kero's helper, so there is no
+    /// channel to work over. Saying so is better than showing this Mac's files
+    /// under the remote's name.
+    var remoteHeaderState: RemotePaneHeaderState {
+        if location.remoteConnection != nil {
+            return RemotePaneHeaderView.headerState(for: location)
+        }
+        return isRunningUnmanagedSSH ? .unmanaged : .local
+    }
+
+    /// True when the foreground job is an ssh client Kero is not in front of.
+    /// The kernel-reported image is used rather than the tab title, which is
+    /// terminal output the remote can write.
+    private var isRunningUnmanagedSSH: Bool {
+        guard let foreground = surface.foregroundPid, foreground > 0,
+              foreground != shellPid,
+              let path = processExecutablePath(pid: foreground)
+        else { return false }
+        return (path as NSString).lastPathComponent == "ssh"
+    }
+
     /// The remote this session is fully ready to work on. Both the backend and
     /// the panel path read this, so the pane can never pair a remote backend
     /// with a local path or the reverse.
