@@ -111,7 +111,7 @@ final class SessionInfoModel: nonisolated ObservableObject {
         guard shellPid == pid else { return }
         if self.processes != processes { self.processes = processes }
         if self.ports != ports { self.ports = ports }
-        let name = isRemote ? (names[pid] ?? "") : localShellName
+        let name = isRemote ? (names[pid].map(Self.displayName) ?? "") : localShellName
         if shellName != name { shellName = name }
     }
 
@@ -125,6 +125,13 @@ final class SessionInfoModel: nonisolated ObservableObject {
 
     // MARK: - Polling
 
+    /// A login shell appears in a process table with a leading dash, "-bash":
+    /// an argv[0] convention marking the shell as a login shell, not part of
+    /// the program's name. The full executable path is kept as it is.
+    private static func displayName(_ name: String) -> String {
+        name.hasPrefix("-") ? String(name.dropFirst()) : name
+    }
+
     private static func snapshot(
         shellPid: pid_t, backend: WorkspaceBackend
     ) async -> ([ProcessItem], [PortItem], [pid_t: String]) {
@@ -133,7 +140,7 @@ final class SessionInfoModel: nonisolated ObservableObject {
         let processes = snapshot.descendants.map {
             ProcessItem(
                 pid: $0.pid,
-                name: $0.name,
+                name: displayName($0.name),
                 executable: $0.executable,
                 cpu: $0.cpu,
                 memoryKB: $0.memoryKB
@@ -148,7 +155,7 @@ final class SessionInfoModel: nonisolated ObservableObject {
             PortItem(
                 port: $0.port,
                 pid: $0.pid,
-                processName: snapshot.namesByPid[$0.pid] ?? "?"
+                processName: snapshot.namesByPid[$0.pid].map(displayName) ?? "?"
             )
         }
         return (processes, ports, snapshot.namesByPid)
