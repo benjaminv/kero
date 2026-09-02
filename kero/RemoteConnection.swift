@@ -75,7 +75,7 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
     /// probe. Panel work can afford to wait; a probe that waits is a drop
     /// this session has not noticed yet.
     lazy var livenessBackend: SSHWorkspaceBackend = SSHWorkspaceBackend(
-        runner: self, timeout: 5
+        runner: self, timeout: 3
     )
     /// Remote working directory, filled in by the cwd probe.
     @Published var workingDirectory: String?

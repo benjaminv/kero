@@ -310,7 +310,10 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             }
 
             tick += 1
-            guard tick.isMultiple(of: 2) else { continue }
+            // Every 2 s while healthy, but every second once a probe has
+            // failed: the second opinion that confirms a drop should not wait
+            // out a full cycle when the pane is already showing stale state.
+            guard tick.isMultiple(of: 2) || consecutiveFailures > 0 else { continue }
 
             // One real round trip every 2 s. This is the liveness test, not
             // `-O check`: the multiplexing master runs on this Mac and keeps
