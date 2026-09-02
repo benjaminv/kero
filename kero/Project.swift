@@ -182,47 +182,44 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         if let pinned = customDirectory, FileManager.default.fileExists(atPath: pinned) {
             return (pinned, .pinned)
         }
-        let shellRoot = Self.closestGitRepository(containing: cwd) ?? cwd
+        let shellRoot = LocalWorkspaceBackend.gitRootSync(containing: cwd) ?? cwd
         // Only a *different repository* re-roots the panels. A foreground job
         // running in a subdirectory of the shell's own checkout resolves to
         // the same root and is ignored, which keeps the file tree from
         // collapsing its expanded rows every time a command runs.
         if let foregroundCwd,
-           let foregroundRoot = Self.closestGitRepository(containing: foregroundCwd),
+           let foregroundRoot = LocalWorkspaceBackend.gitRootSync(containing: foregroundCwd),
            foregroundRoot != shellRoot {
-            return (foregroundRoot, .foreground(isWorktree: Self.isLinkedWorktree(foregroundRoot)))
+            return (
+                foregroundRoot,
+                .foreground(isWorktree: LocalWorkspaceBackend.isLinkedWorktreeSync(foregroundRoot))
+            )
         }
         return (shellRoot, .shell)
     }
 
-    /// Whether `root` is a linked worktree rather than a normal checkout: its
-    /// `.git` is a file pointing into the main repository's `worktrees`
-    /// directory (a submodule's points into `modules` instead).
-    private static func isLinkedWorktree(_ root: String) -> Bool {
-        let gitPath = (root as NSString).appendingPathComponent(".git")
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: gitPath, isDirectory: &isDirectory),
-              !isDirectory.boolValue,
-              let contents = try? String(contentsOfFile: gitPath, encoding: .utf8)
-        else { return false }
-        return contents.contains("/worktrees/")
-    }
-
-    /// The directory of the nearest enclosing git repository: walks up from
-    /// `path` looking for a `.git` entry — a directory in normal checkouts,
-    /// a file in worktrees and submodules.
-    private static func closestGitRepository(containing path: String) -> String? {
-        var dir = (path as NSString).standardizingPath
-        guard dir.hasPrefix("/") else { return nil }
-        let fm = FileManager.default
-        while true {
-            if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(".git")) {
-                return dir
-            }
-            let parent = (dir as NSString).deletingLastPathComponent
-            if parent == dir { return nil }
-            dir = parent
+    /// The same root over a workspace that may be a remote machine. Keep the
+    /// two in step: the synchronous form above stays only for callers that
+    /// cannot await (the command palette and the Git panel), and both reach
+    /// the same walk — one through `LocalWorkspaceBackend`'s helpers, one
+    /// through the backend that wraps them.
+    func panelRoot(
+        followingSessionAt cwd: String,
+        foregroundAt foregroundCwd: String? = nil,
+        backend: WorkspaceBackend
+    ) async -> (root: String, source: PanelRootSource) {
+        if let pinned = customDirectory,
+           ((try? await backend.stat(path: pinned)) ?? nil) != nil {
+            return (pinned, .pinned)
         }
+        let shellRoot = ((try? await backend.gitRoot(containing: cwd)) ?? nil) ?? cwd
+        if let foregroundCwd,
+           let foregroundRoot = (try? await backend.gitRoot(containing: foregroundCwd)) ?? nil,
+           foregroundRoot != shellRoot {
+            let isWorktree = (try? await backend.isLinkedWorktree(foregroundRoot)) ?? false
+            return (foregroundRoot, .foreground(isWorktree: isWorktree))
+        }
+        return (shellRoot, .shell)
     }
 
     // MARK: - Sessions
@@ -661,7 +658,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
 
         switch response {
         case .alertFirstButtonReturn: // Save
-            content.save()
+            await content.save()
             // Keep the pane open if the write failed; the error bar shows why.
             guard content.saveError == nil else { return true }
             removePaneWithContent(content.id)

@@ -20,6 +20,9 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         case text
         case image(NSImage)
         case unavailable(String)
+        /// Waiting for the first read. Only reachable on a workspace that
+        /// cannot answer immediately, since this tab is created synchronously.
+        case loading
     }
 
     private(set) var content: Content
@@ -56,6 +59,10 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     private var imageFingerprint: Int?
     private var reloadGeneration: UInt = 0
     private var reloadTask: Task<Void, Never>?
+    /// The workspace this file lives on. Assigned once by whoever opens the
+    /// tab; a remote file keeps reading and saving over that connection even
+    /// while the panels follow another session.
+    private let backend: WorkspaceBackend
 
     private struct LoadedContent {
         let content: Content
@@ -63,13 +70,22 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         let imageFingerprint: Int?
     }
 
-    init(path: String) {
+    init(path: String, backend: WorkspaceBackend = LocalWorkspaceBackend.shared) {
         self.path = path
-        let loaded = Self.load(path: path)
-        content = loaded.content
-        text = loaded.text
-        savedText = loaded.text
-        imageFingerprint = loaded.imageFingerprint
+        self.backend = backend
+        // This initializer is synchronous (a file opens from a menu, a click,
+        // or session restore), so a workspace that can answer immediately does
+        // so here rather than flashing a placeholder on every open.
+        let loaded = (backend as? LocalWorkspaceBackend).map {
+            Self.loadedContent(path: path, data: $0.readImmediately(path: path))
+        }
+        content = loaded?.content ?? .loading
+        text = loaded?.text ?? ""
+        savedText = loaded?.text ?? ""
+        imageFingerprint = loaded?.imageFingerprint
+        if case .loading = content {
+            reloadFromDiskIfClean()
+        }
     }
 
     var name: String {
@@ -105,13 +121,15 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         }
     }
 
-    func save() {
+    func save() async {
         guard case .text = content, isDirty else { return }
         invalidateReload()
+        let written = text
         do {
-            try text.write(toFile: path, atomically: true, encoding: .utf8)
-            savedText = text
-            isDirty = false
+            try await backend.write(path: path, data: Data(written.utf8))
+            savedText = written
+            // An edit landing while the write was in flight stays dirty.
+            refreshDirtyState()
             saveError = nil
         } catch {
             saveError = error.localizedDescription
@@ -128,10 +146,9 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         let generation = reloadGeneration
         let expectedPath = path
 
+        let backend = self.backend
         reloadTask = Task { [weak self] in
-            let data = await Task.detached(priority: .userInitiated) {
-                Self.readData(path: expectedPath)
-            }.value
+            let data = try? await backend.read(path: expectedPath, maxBytes: .max)
             guard !Task.isCancelled,
                   let self,
                   self.reloadGeneration == generation,
@@ -167,14 +184,6 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         default:
             return false
         }
-    }
-
-    private static func load(path: String) -> LoadedContent {
-        loadedContent(path: path, data: readData(path: path))
-    }
-
-    private nonisolated static func readData(path: String) -> Data? {
-        try? Data(contentsOf: URL(fileURLWithPath: path))
     }
 
     private static func loadedContent(path: String, data: Data?) -> LoadedContent {
@@ -252,6 +261,9 @@ struct FileViewerView: View {
                     Image(nsImage: image)
                         .padding(16)
                 }
+            case .loading:
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let reason):
                 VStack(spacing: 8) {
                     MaterialFileIconView(path: file.path, size: 28, opacity: 0.72)

@@ -82,10 +82,10 @@ extension PaneContent {
         }
     }
 
-    @MainActor func save() {
+    @MainActor func save() async {
         switch self {
-        case .file(let file): file.save()
-        case .diff(let diff): diff.save()
+        case .file(let file): await file.save()
+        case .diff(let diff): await diff.save()
         case .session, .browser: break
         }
     }

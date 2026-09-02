@@ -36,6 +36,14 @@ final class FileTreeModel: nonisolated ObservableObject {
     @Published private(set) var draft: Draft?
     private var expanded: Set<String> = []
 
+    /// The workspace this tree reads. Replaced on every `sync`, so the tree
+    /// follows its session between the local disk and a remote machine.
+    private var backend: WorkspaceBackend = LocalWorkspaceBackend.shared
+    /// A rebuild is a round trip per visible directory, so only one runs at a
+    /// time; anything arriving mid-flight is folded into one further pass.
+    private var isRebuilding = false
+    private var rebuildPending = false
+
     var rootName: String {
         (rootPath as NSString).lastPathComponent
     }
@@ -46,7 +54,8 @@ final class FileTreeModel: nonisolated ObservableObject {
 
     /// Points the tree at `root` (collapsing everything if it moved) and
     /// re-reads visible directories. Cheap when nothing changed.
-    func sync(root: String) {
+    func sync(root: String, backend: WorkspaceBackend) async {
+        self.backend = backend
         if root != rootPath {
             rootPath = root
             expanded = []
@@ -54,23 +63,21 @@ final class FileTreeModel: nonisolated ObservableObject {
             renamingPath = nil
             draft = nil
         }
-        rebuild()
+        await rebuild()
     }
 
-    func toggle(_ item: Item) {
+    func toggle(_ item: Item) async {
         guard item.isDirectory else { return }
         if !expanded.insert(item.path).inserted {
             expanded.remove(item.path)
         }
-        rebuild()
+        await rebuild()
     }
 
     /// Moves `item` to the Trash, then rebuilds so it drops out of the tree.
-    func moveToTrash(_ item: Item) {
+    func moveToTrash(_ item: Item) async {
         do {
-            try FileManager.default.trashItem(
-                at: URL(fileURLWithPath: item.path), resultingItemURL: nil
-            )
+            try await backend.delete(paths: [item.path])
             expanded.remove(item.path)
         } catch {
             presentError(
@@ -81,7 +88,7 @@ final class FileTreeModel: nonisolated ObservableObject {
                 error.localizedDescription
             )
         }
-        rebuild()
+        await rebuild()
     }
 
     // MARK: - Rename
@@ -99,7 +106,7 @@ final class FileTreeModel: nonisolated ObservableObject {
     /// absolute path when the file actually moved, so callers can follow it
     /// (e.g. re-point open tabs).
     @discardableResult
-    func rename(_ item: Item, to newName: String) -> String? {
+    func rename(_ item: Item, to newName: String) async -> String? {
         renamingPath = nil
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != item.name else { return nil }
@@ -112,11 +119,11 @@ final class FileTreeModel: nonisolated ObservableObject {
         }
         let dir = (item.path as NSString).deletingLastPathComponent
         let dest = (dir as NSString).appendingPathComponent(trimmed)
-        let fm = FileManager.default
         // A case-only rename ("foo"→"Foo") maps to the same file on a
         // case-insensitive volume, so don't treat that as a collision.
         let caseOnlyChange = trimmed.lowercased() == item.name.lowercased()
-        guard caseOnlyChange || !fm.fileExists(atPath: dest) else {
+        let exists = (try? await backend.stat(path: dest)) ?? nil
+        guard caseOnlyChange || exists == nil else {
             presentError(
                 String(localized: "Couldn’t rename to “\(trimmed)”."),
                 String(localized: "An item named “\(trimmed)” already exists here.")
@@ -124,13 +131,13 @@ final class FileTreeModel: nonisolated ObservableObject {
             return nil
         }
         do {
-            try fm.moveItem(atPath: item.path, toPath: dest)
+            try await backend.rename(from: item.path, to: dest)
             remapExpanded(from: item.path, to: dest)
         } catch {
             presentError(String(localized: "Couldn’t rename to “\(trimmed)”."), error.localizedDescription)
             return nil
         }
-        rebuild()
+        await rebuild()
         return dest
     }
 
@@ -151,72 +158,77 @@ final class FileTreeModel: nonisolated ObservableObject {
     // MARK: - Create (inline draft)
 
     /// Opens an inline input row for a new file inside `directory`.
-    func beginNewFile(in directory: String) {
-        startDraft(in: directory, isDirectory: false)
+    func beginNewFile(in directory: String) async {
+        await startDraft(in: directory, isDirectory: false)
     }
 
     /// Opens an inline input row for a new folder inside `directory`.
-    func beginNewFolder(in directory: String) {
-        startDraft(in: directory, isDirectory: true)
+    func beginNewFolder(in directory: String) async {
+        await startDraft(in: directory, isDirectory: true)
     }
 
-    private func startDraft(in directory: String, isDirectory: Bool) {
+    private func startDraft(in directory: String, isDirectory: Bool) async {
         renamingPath = nil
         draft = Draft(parentDir: directory, isDirectory: isDirectory)
         // Reveal the folder's contents so the input row is visible.
         expanded.insert(directory)
-        rebuild()
+        await rebuild()
     }
 
-    func cancelDraft() {
+    func cancelDraft() async {
         guard draft != nil else { return }
         draft = nil
-        rebuild()
+        await rebuild()
     }
 
     /// Commits the pending draft, creating the file or folder. An empty name
     /// cancels (matching VS Code). Returns the new file's path — for files
     /// only — so the caller can open it.
     @discardableResult
-    func commitDraft(name: String) -> String? {
+    func commitDraft(name: String) async -> String? {
         guard let draft else { return nil }
         self.draft = nil
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { rebuild(); return nil }
+        guard !trimmed.isEmpty else { await rebuild(); return nil }
         guard !trimmed.contains("/"), trimmed != ".", trimmed != ".." else {
             presentError(
                 String(localized: "Couldn’t create “\(trimmed)”."),
                 String(localized: "A name can’t contain “/” or be “.” or “..”.")
             )
-            rebuild()
+            await rebuild()
             return nil
         }
         let dest = (draft.parentDir as NSString).appendingPathComponent(trimmed)
-        let fm = FileManager.default
-        guard !fm.fileExists(atPath: dest) else {
+        let exists = (try? await backend.stat(path: dest)) ?? nil
+        guard exists == nil else {
             presentError(
                 String(localized: "Couldn’t create “\(trimmed)”."),
                 String(localized: "An item named “\(trimmed)” already exists here.")
             )
-            rebuild()
+            await rebuild()
             return nil
         }
         var createdFile: String?
         if draft.isDirectory {
             do {
-                try fm.createDirectory(atPath: dest, withIntermediateDirectories: false)
+                try await backend.createDirectory(path: dest)
             } catch {
                 presentError(String(localized: "Couldn’t create the folder."), error.localizedDescription)
             }
-        } else if fm.createFile(atPath: dest, contents: nil) {
-            createdFile = dest
         } else {
-            presentError(
-                String(localized: "Couldn’t create the file."),
-                String(localized: "It could not be written to disk.")
-            )
+            do {
+                try await backend.createFile(path: dest)
+                createdFile = dest
+            } catch WorkspaceError.createFileFailed {
+                presentError(
+                    String(localized: "Couldn’t create the file."),
+                    String(localized: "It could not be written to disk.")
+                )
+            } catch {
+                presentError(String(localized: "Couldn’t create the file."), error.localizedDescription)
+            }
         }
-        rebuild()
+        await rebuild()
         return createdFile
     }
 
@@ -228,18 +240,29 @@ final class FileTreeModel: nonisolated ObservableObject {
         alert.runModal()
     }
 
-    private func rebuild() {
+    private func rebuild() async {
         guard !rootPath.isEmpty else { return }
-        var out: [Item] = []
-        appendChildren(of: rootPath, depth: 0, into: &out)
-        if out != items {
-            items = out
+        // A rebuild requested while one is in flight would read the tree twice
+        // over the same channel; run one more pass instead of a second walk.
+        if isRebuilding {
+            rebuildPending = true
+            return
         }
+        isRebuilding = true
+        repeat {
+            rebuildPending = false
+            let out = await children(of: rootPath, depth: 0)
+            if out != items {
+                items = out
+            }
+        } while rebuildPending
+        isRebuilding = false
     }
 
-    private func appendChildren(of dir: String, depth: Int, into out: inout [Item]) {
+    private func children(of dir: String, depth: Int) async -> [Item] {
         // Guard against runaway recursion through symlink cycles.
-        guard depth < 32 else { return }
+        guard depth < 32 else { return [] }
+        var out: [Item] = []
         // Show the inline new-file/folder input at the top of its folder.
         if let draft, draft.parentDir == dir {
             out.append(
@@ -249,27 +272,29 @@ final class FileTreeModel: nonisolated ObservableObject {
                 )
             )
         }
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        guard let entries = try? await backend.list(directory: dir) else { return out }
 
-        let children = names
-            .filter { $0 != ".git" }
-            .map { name -> Item in
-                let path = (dir as NSString).appendingPathComponent(name)
-                var isDir: ObjCBool = false
-                fm.fileExists(atPath: path, isDirectory: &isDir)
-                return Item(name: name, path: path, isDirectory: isDir.boolValue, depth: depth)
+        let rows = entries
+            .filter { $0.name != ".git" }
+            .map { entry in
+                Item(
+                    name: entry.name,
+                    path: (dir as NSString).appendingPathComponent(entry.name),
+                    isDirectory: entry.isDirectory,
+                    depth: depth
+                )
             }
             .sorted { a, b in
                 if a.isDirectory != b.isDirectory { return a.isDirectory }
                 return a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
 
-        for child in children {
-            out.append(child)
-            if child.isDirectory, expanded.contains(child.path) {
-                appendChildren(of: child.path, depth: depth + 1, into: &out)
+        for row in rows {
+            out.append(row)
+            if row.isDirectory, expanded.contains(row.path) {
+                out.append(contentsOf: await children(of: row.path, depth: depth + 1))
             }
         }
+        return out
     }
 }

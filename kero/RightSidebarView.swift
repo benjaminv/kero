@@ -6,6 +6,31 @@
 import AppKit
 import SwiftUI
 
+/// Serialises the right pane's refreshes. Reading a panel costs a round trip
+/// per directory on a remote workspace, so a tick arriving while one refresh
+/// is in flight is folded into a single further pass rather than running
+/// alongside it — and never dropped, so a `cd` mid-refresh still lands.
+@MainActor
+private final class PanelSyncQueue {
+    private var isRunning = false
+    private var pending = false
+
+    func run(_ body: @escaping () async -> Void) {
+        if isRunning {
+            pending = true
+            return
+        }
+        isRunning = true
+        Task { @MainActor in
+            repeat {
+                pending = false
+                await body()
+            } while pending
+            isRunning = false
+        }
+    }
+}
+
 /// Right sidebar: hidden by default, toggled from the terminal's corner
 /// button or ⇧⌘B. Files/Git switch via tabs along its top, otty-style.
 struct RightSidebarView: View {
@@ -18,6 +43,7 @@ struct RightSidebarView: View {
     @State private var applicationIsActive = NSApp.isActive
     /// Which rule produced the current panel root; drives the Files badge.
     @State private var rootSource = Project.PanelRootSource.shell
+    @State private var syncQueue = PanelSyncQueue()
     @AppStorage("rightSidebarWidth") private var width: Double = 240
 
     private var pollsSelectedPanel: Bool {
@@ -212,30 +238,38 @@ struct RightSidebarView: View {
     }
 
     private func syncModels() {
+        syncQueue.run { await performSync() }
+    }
+
+    private func performSync() async {
         guard manager.isPanelVisible,
               let project = manager.selectedProject,
               let session = project.selectedSession
         else { return }
         let cwd = session.currentDirectoryPath
+        let backend = session.workspaceBackend
         // Files and Git anchor to the project directory — pinned when the
         // user set one, else the repository the session is working in — so
         // they don't re-root as the terminal cds around a repo; Info
         // describes the shell itself, showing its live cwd next to that root.
         // An agent that moves to its own worktree changes only its own
         // process directory, so the foreground job's cwd is passed in too.
-        let (root, source) = project.panelRoot(
-            followingSessionAt: cwd, foregroundAt: session.foregroundDirectoryPath
+        let (root, source) = await project.panelRoot(
+            followingSessionAt: cwd,
+            foregroundAt: session.foregroundDirectoryPath,
+            backend: backend
         )
         if rootSource != source { rootSource = source }
         switch manager.panelTab {
         case .files:
-            fileTree.sync(root: root)
+            await fileTree.sync(root: root, backend: backend)
         case .git:
             break
         case .info:
-            info.sync(
+            await info.sync(
                 root: cwd, projectRoot: root, projectRootSource: source,
-                shellName: session.shellName, shellPid: session.shellPid
+                shellName: session.shellName, shellPid: session.shellPid,
+                backend: backend
             )
         }
     }
@@ -422,10 +456,10 @@ private struct FileTreeRow: View {
             }
             Divider()
             Button("New File…") {
-                model.beginNewFile(in: item.path)
+                Task { await model.beginNewFile(in: item.path) }
             }
             Button("New Folder…") {
-                model.beginNewFolder(in: item.path)
+                Task { await model.beginNewFolder(in: item.path) }
             }
         }
         Divider()
@@ -433,8 +467,10 @@ private struct FileTreeRow: View {
             model.beginRename(item)
         }
         Button("Move to Trash", role: .destructive) {
-            model.moveToTrash(item)
-            refreshGitStatus()
+            Task {
+                await model.moveToTrash(item)
+                refreshGitStatus()
+            }
         }
     }
 
@@ -444,9 +480,12 @@ private struct FileTreeRow: View {
     private func commitRename() {
         guard isRenaming else { return }
         let oldPath = item.path
-        if let newPath = model.rename(item, to: editingName) {
-            onRename(oldPath, newPath)
-            refreshGitStatus()
+        let newName = editingName
+        Task {
+            if let newPath = await model.rename(item, to: newName) {
+                onRename(oldPath, newPath)
+                refreshGitStatus()
+            }
         }
     }
 
@@ -454,10 +493,13 @@ private struct FileTreeRow: View {
     /// Guarded so the commit-on-blur after Enter/Escape is a no-op.
     private func commitDraft() {
         guard item.isDraft, model.draft != nil else { return }
-        if let created = model.commitDraft(name: editingName) {
-            openFile(created)
+        let name = editingName
+        Task {
+            if let created = await model.commitDraft(name: name) {
+                openFile(created)
+            }
+            refreshGitStatus()
         }
-        refreshGitStatus()
     }
 
     @ViewBuilder
@@ -472,7 +514,7 @@ private struct FileTreeRow: View {
     private var rowButton: some View {
         Button {
             if item.isDirectory {
-                model.toggle(item)
+                Task { await model.toggle(item) }
             } else {
                 openFile(item.path)
             }
@@ -543,7 +585,10 @@ private struct FileTreeRow: View {
                 ? String(localized: "Folder name")
                 : String(localized: "File name"))
                 .onSubmit { commitDraft() }
-                .onKeyPress(.escape) { model.cancelDraft(); return .handled }
+                .onKeyPress(.escape) {
+                    Task { await model.cancelDraft() }
+                    return .handled
+                }
                 .onChange(of: fieldFocused) {
                     // Blur commits a typed name, cancels an empty one (VS Code).
                     if !fieldFocused { commitDraft() }
@@ -2233,7 +2278,7 @@ private struct InfoPanel: View {
                 subtitle: model.shellPid > 0 ? "pid \(String(model.shellPid))" : nil
             )
             Button {
-                model.refresh()
+                Task { await model.refresh() }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .sidebarFont(size: 10, weight: .medium)
@@ -2383,7 +2428,7 @@ private struct InfoPanel: View {
             } else {
                 ForEach(model.processes) { process in
                     InfoProcessRow(process: process) { force in
-                        model.kill(process.pid, force: force)
+                        Task { await model.kill(process.pid, force: force) }
                     }
                 }
             }
@@ -2406,7 +2451,7 @@ private struct InfoPanel: View {
             } else {
                 ForEach(model.ports) { port in
                     InfoPortRow(port: port) { force in
-                        model.kill(port.pid, force: force)
+                        Task { await model.kill(port.pid, force: force) }
                     }
                 }
             }
