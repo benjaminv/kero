@@ -1297,9 +1297,21 @@ final class GitStatusModel: nonisolated ObservableObject {
         // timeout.
         let deadline = Date().addingTimeInterval(10)
         let timeoutMessage = String(localized: "Git did not respond in time.")
+        // On a remote workspace the commands that do not depend on each
+        // other's output are fetched together first, because a round trip
+        // costs far more than the command does. `statusGit` then answers
+        // from that batch, so the snapshot below reads exactly as it does
+        // locally and parses exactly the same text.
+        let prefetched = await prefetchedSnapshotCommands(
+            in: root, recentCommitLimit: recentCommitLimit, backend: backend,
+            deadline: deadline
+        )
         func statusGit(
             _ args: [String], in directory: String
         ) async -> (status: Int32, stdout: String, stderr: String) {
+            if let batched = prefetched[args.joined(separator: " ")] {
+                return batched
+            }
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { return (-2, "", timeoutMessage) }
             return await runGit(args, in: directory, timeout: remaining, backend: backend)
@@ -1434,6 +1446,69 @@ final class GitStatusModel: nonisolated ObservableObject {
         return .repository(result)
     }
 
+    /// The snapshot commands that need nothing from each other, fetched in one
+    /// round trip. Empty for a local workspace, where a command costs almost
+    /// nothing and the existing path is left exactly as it was.
+    ///
+    /// Each command merges its standard error into its output, because the
+    /// failure text is the message the panel shows and `gitFailureMessage`
+    /// already prefers whichever stream carries it.
+    private nonisolated static func prefetchedSnapshotCommands(
+        in root: String, recentCommitLimit: Int, backend: WorkspaceBackend,
+        deadline: Date
+    ) async -> [String: (status: Int32, stdout: String, stderr: String)] {
+        guard !(backend is LocalWorkspaceBackend) else { return [:] }
+        let argumentSets: [[String]] = [
+            ["rev-parse", "--show-toplevel"],
+            [
+                "status", "--porcelain=v2", "--branch", "-z",
+                "--untracked-files=all", "--ignored=matching",
+            ],
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            ["remote"],
+            [
+                "log", "-n", "\(recentCommitLimit + 1)", "--decorate=short",
+                "--pretty=format:%x1e%H%x1f%h%x1f%s%x1f%an%x1f%ct%x1f%P%x1f%D",
+                "--name-status", "-z",
+            ],
+            ["rev-list", "--walk-reflogs", "--count", "refs/stash"],
+            ["rev-parse", "--absolute-git-dir"],
+        ]
+        let tag = UUID().uuidString
+        let commands = argumentSets.map { args in
+            (
+                name: args.joined(separator: " "),
+                command: "env GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 LC_ALL=C git "
+                    + args.map(RemoteCommands.quote).joined(separator: " ") + " 2>&1"
+            )
+        }
+        // Every batched command runs at the repository top level, which is
+        // where the snapshot runs them one by one. A directory that is not a
+        // repository answers with the first command alone, so leaving a
+        // repository does not pay for six commands that are all going to fail.
+        let toplevel = RemoteCommands.batchCommand([commands[0]], tag: tag)
+        let script = "cd \(RemoteCommands.quote(root)) || exit 1; "
+            + "t=$(git rev-parse --show-toplevel 2>/dev/null); "
+            + "if [ -z \"$t\" ]; then \(toplevel); else cd \"$t\" || exit 1; "
+            + RemoteCommands.batchCommand(commands, tag: tag) + "; fi"
+
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0,
+            let result = try? await backend.run(
+                argv: ["sh", "-c", script], cwd: nil, env: nil, stdin: nil,
+                timeout: remaining
+            )
+        else { return [:] }
+
+        var answers: [String: (status: Int32, stdout: String, stderr: String)] = [:]
+        for (name, batched) in RemoteCommands.parseBatch(result.stdout, tag: tag) {
+            answers[name] = (
+                batched.status, String(decoding: batched.stdout, as: UTF8.self), ""
+            )
+        }
+        return answers
+    }
+
     private nonisolated static func resolveRepositoryRoot(
         in root: String, backend: WorkspaceBackend
     ) async -> String? {
@@ -1449,6 +1524,19 @@ final class GitStatusModel: nonisolated ObservableObject {
     private nonisolated static func containsGitMetadata(
         atOrAbove root: String, backend: WorkspaceBackend
     ) async -> Bool {
+        if !(backend is LocalWorkspaceBackend) {
+            // The ancestor walk is one round trip per level otherwise, and it
+            // runs every time the panel leaves a repository.
+            guard let result = try? await backend.run(
+                argv: [
+                    "sh", "-c",
+                    RemoteCommands.gitMetadataAtOrAboveCommand(path: root),
+                ],
+                cwd: nil, env: nil, stdin: nil, timeout: nil
+            ) else { return false }
+            return String(decoding: result.stdout, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines) == "yes"
+        }
         // Walk path strings, not URLs: `URL.deletingLastPathComponent()` keeps
         // appending ".." at the filesystem root, so a URL ascent never
         // reaches its fixed point and spins forever. The NSString walk
@@ -1463,6 +1551,26 @@ final class GitStatusModel: nonisolated ObservableObject {
             let parent = directory.deletingLastPathComponent as NSString
             if parent.isEqual(to: directory as String) { return false }
             directory = parent
+        }
+    }
+
+    /// One round trip instead of one per marker.
+    private nonisolated static func remoteRepositoryOperation(
+        gitDirectory: String, backend: WorkspaceBackend
+    ) async -> String? {
+        guard let result = try? await backend.run(
+            argv: ["sh", "-c", RemoteCommands.repositoryOperationCommand(gitDirectory: gitDirectory)],
+            cwd: nil, env: nil, stdin: nil, timeout: nil
+        ), result.status == 0 else { return nil }
+        let marker = String(decoding: result.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch marker {
+        case "rebase-merge", "rebase-apply": return String(localized: "Rebase in progress")
+        case "MERGE_HEAD": return String(localized: "Merge in progress")
+        case "CHERRY_PICK_HEAD": return String(localized: "Cherry-pick in progress")
+        case "REVERT_HEAD": return String(localized: "Revert in progress")
+        case "BISECT_LOG": return String(localized: "Bisect in progress")
+        default: return nil
         }
     }
 
@@ -1767,6 +1875,9 @@ final class GitStatusModel: nonisolated ObservableObject {
         gitDirectory: String, backend: WorkspaceBackend
     ) async -> String? {
         let git = URL(fileURLWithPath: gitDirectory, isDirectory: true)
+        if !(backend is LocalWorkspaceBackend) {
+            return await remoteRepositoryOperation(gitDirectory: gitDirectory, backend: backend)
+        }
         func exists(_ name: String) async -> Bool {
             let path = git.appendingPathComponent(name).path
             return (try? await backend.stat(path: path)) != nil

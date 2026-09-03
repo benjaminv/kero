@@ -306,6 +306,79 @@ nonisolated enum RemoteCommands {
         }
     }
 
+    /// Which in-progress operation a repository is in, in one round trip.
+    ///
+    /// Asking about each marker separately is six round trips for a question
+    /// answered by six `test` calls, and it is asked on every snapshot.
+    /// Prints the first marker that exists, in the caller's priority order.
+    static func repositoryOperationCommand(gitDirectory: String) -> String {
+        let quoted = quote(gitDirectory)
+        return "for n in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD "
+            + "REVERT_HEAD BISECT_LOG; do if [ -e \(quoted)\"/$n\" ]; then "
+            + "printf '%s\\n' \"$n\"; break; fi; done; :"
+    }
+
+    /// Whether any directory at or above `path` holds a `.git`, in one round
+    /// trip rather than one per ancestor. Prints `yes` or nothing.
+    ///
+    /// This is what tells a plain directory apart from a repository whose
+    /// metadata is broken, so it runs every time the panel leaves a repository.
+    static func gitMetadataAtOrAboveCommand(path: String) -> String {
+        "d=\(quote(path)); while :; do if [ -e \"$d/.git\" ]; then printf 'yes\\n'; "
+            + "break; fi; if [ \"$d\" = \"/\" ]; then break; fi; "
+            + "d=$(dirname \"$d\"); done; :"
+    }
+
+    /// Runs several commands in one round trip, tagging each result so the
+    /// Mac can tell them apart.
+    ///
+    /// A remote round trip costs about 60 ms before any work happens, so a
+    /// snapshot built from a dozen sequential commands spends most of its time
+    /// waiting. The tag is a fresh UUID per request, which cannot appear in
+    /// any command's output, and the marker is preceded by a newline so it is
+    /// always at the start of a line even when the output has no trailing one.
+    static func batchCommand(_ commands: [(name: String, command: String)], tag: String) -> String {
+        commands
+            .map { "{ \($0.command) ; }; printf '\\n%s %s %d\\n' \(quote(tag)) \(quote($0.name)) \"$?\"" }
+            .joined(separator: "; ")
+    }
+
+    struct BatchResult {
+        let status: Int32
+        let stdout: Data
+    }
+
+    /// Splits a batch's output back into one result per command. Works on
+    /// bytes, because `git log -z` and `git status -z` embed NULs.
+    static func parseBatch(_ output: Data, tag: String) -> [String: BatchResult] {
+        let separator = Data(("\n" + tag + " ").utf8)
+        var results: [String: BatchResult] = [:]
+        var chunks: [Data] = []
+        var rest = output
+        while let found = rest.range(of: separator) {
+            chunks.append(rest[rest.startIndex..<found.lowerBound])
+            rest = rest[found.upperBound...]
+        }
+        chunks.append(rest)
+
+        // Each chunk after the first opens with the previous command's marker
+        // line, "<name> <status>", and the rest of it is the next output.
+        var pendingOutput = chunks.first ?? Data()
+        for chunk in chunks.dropFirst() {
+            guard let newline = chunk.firstIndex(of: 0x0A) else { break }
+            let marker = String(decoding: chunk[chunk.startIndex..<newline], as: UTF8.self)
+            // The name may contain spaces (they are command lines), so the
+            // status is the LAST field and the name is everything before it.
+            let fields = marker.split(separator: " ")
+            if fields.count >= 2, let status = Int32(fields[fields.count - 1]) {
+                let name = fields.dropLast().joined(separator: " ")
+                results[name] = BatchResult(status: status, stdout: pendingOutput)
+            }
+            pendingOutput = chunk[chunk.index(after: newline)...]
+        }
+        return results
+    }
+
     // MARK: - Processes and ports
 
     /// `args` last, because it is the only column that contains spaces.
@@ -535,6 +608,32 @@ extension RemoteCommands {
         // A path containing a tab survives, because the path is the last field.
         assert(parseUntrackedLineCounts("2\t4\t/repo/od\td")[0].path == "/repo/od\td")
         assert(parseUntrackedLineCounts("rubbish").isEmpty)
+
+        let operation = repositoryOperationCommand(gitDirectory: "/r/.git")
+        assert(operation.contains("'/r/.git'\"/$n\""))
+        assert(operation.contains("rebase-merge rebase-apply MERGE_HEAD"))
+        let walk = gitMetadataAtOrAboveCommand(path: "/a/b")
+        assert(walk.hasPrefix("d='/a/b';") && walk.contains("dirname"))
+
+        // Names are command lines and contain spaces, which the marker parse
+        // has to survive - the status is the last field, not the second.
+        let batch = batchCommand(
+            [("rev-parse --show-toplevel", "git rev-parse"), ("st", "git status")],
+            tag: "TAG-1")
+        assert(batch.contains("{ git rev-parse ; }"))
+        assert(batch.contains("printf '\\n%s %s %d\\n' 'TAG-1' 'rev-parse --show-toplevel' \"$?\""))
+        // Output with no trailing newline, and a NUL, both survive.
+        var batchOut = Data("/repo".utf8)
+        batchOut.append(Data("\nTAG-1 rev-parse --show-toplevel 0\n".utf8))
+        batchOut.append(Data([0x61, 0x00, 0x62]))
+        batchOut.append(Data("\nTAG-1 st 1\n".utf8))
+        let parsedBatch = parseBatch(batchOut, tag: "TAG-1")
+        assert(parsedBatch["rev-parse --show-toplevel"]?.status == 0)
+        assert(parsedBatch["rev-parse --show-toplevel"]
+            .map { String(decoding: $0.stdout, as: UTF8.self) } == "/repo")
+        assert(parsedBatch["st"]?.status == 1)
+        assert(parsedBatch["st"]?.stdout == Data([0x61, 0x00, 0x62]))
+        assert(parseBatch(Data(), tag: "TAG-1").isEmpty)
 
         let psOutput = """
               313852  313851  0.0   6144 sshd: ubuntu@pts/0
