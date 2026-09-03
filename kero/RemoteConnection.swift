@@ -137,17 +137,39 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
         return url
     }
 
+    // MARK: - Tracing
+
+    /// Temporary: every state change and probe outcome, appended to
+    /// /tmp/kero-remote-trace.log. Kero's NSLog output was not observable from
+    /// outside the app while diagnosing a dropped connection, and a file is.
+    /// Remove once the drop path is settled.
+    nonisolated static func trace(_ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "\(stamp) \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/kero-remote-trace.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
     // MARK: - State
 
     func markConnected() {
         guard state != .connected else { return }
         state = .connected
         NSLog("kero: remote connection %@ state connected", destination)
+        Self.trace("state connected \(destination)")
     }
 
     func markDisconnected(reason: String) {
         guard state != .disconnected else { return }
         state = .disconnected
+        Self.trace("state disconnected \(destination): \(reason)")
         NSLog(
             "kero: remote connection %@ state disconnected (%@)",
             destination, reason
