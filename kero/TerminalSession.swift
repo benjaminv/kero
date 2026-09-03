@@ -319,11 +319,7 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             // `-O check`: the multiplexing master runs on this Mac and keeps
             // answering while the network is down, so only a command that
             // reaches the other machine can tell a live link from a dead one.
-            let answered = await probeRemoteWorkingDirectory(connection)
-            RemoteConnection.trace(
-                "probe \(answered ? "answered" : "FAILED") state=\(connection.state) failures=\(consecutiveFailures)"
-            )
-            if answered {
+            if await probeRemoteWorkingDirectory(connection) {
                 consecutiveFailures = 0
                 if connection.state == .disconnected {
                     connection.markConnected()
