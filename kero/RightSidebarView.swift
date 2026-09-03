@@ -120,6 +120,14 @@ struct RightSidebarView: View {
         CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
     }
 
+    /// The heading is a published-state read costing nothing, and a connection
+    /// can die while the user is in another app — turning Wi-Fi off in Control
+    /// Centre is exactly that. So it keeps ticking whenever the pane is on
+    /// screen, active or not, while the panel refreshes below do not.
+    private var pollsRemoteHeading: Bool {
+        manager.isPanelVisible
+    }
+
     private var pollsSelectedPanel: Bool {
         manager.isPanelVisible
             && applicationIsActive
@@ -229,6 +237,17 @@ struct RightSidebarView: View {
             }
         }
         .onAppear { syncModels() }
+        .task(id: pollsRemoteHeading) {
+            guard pollsRemoteHeading else { return }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+                applyRemoteHeading()
+            }
+        }
         // Files and process information remain live while visible. Git is
         // event-driven: terminal/Git command completion and app activation
         // refresh it without a repeating main-run-loop source.
