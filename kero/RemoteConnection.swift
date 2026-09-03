@@ -385,10 +385,6 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
         }
     }
 
-    private final class Box: @unchecked Sendable {
-        var value = Data()
-    }
-
     private nonisolated static func runSSHBlocking(
         arguments: [String],
         stdin: Data?,
@@ -425,36 +421,74 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
             }
         }
 
-        let outBox = Box()
-        let errBox = Box()
-        let readers = DispatchGroup()
-        readers.enter()
-        Thread {
-            outBox.value = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            readers.leave()
-        }.start()
-        readers.enter()
-        Thread {
-            errBox.value = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            readers.leave()
-        }.start()
+        // Read with the same deadline that bounds the process.
+        //
+        // Not `readDataToEndOfFile` on a helper thread: ssh's multiplexing
+        // client hands its stdout and stderr to the MASTER process over the
+        // control socket, so the master holds the write ends. Killing this
+        // client does not close them, and a read waiting for end-of-file
+        // waits for the master to finish the session — which, when the
+        // network has gone, means waiting out the whole outage. That is what
+        // made a dropped connection take tens of seconds to notice instead of
+        // the deadline set here.
+        let outFD = stdoutPipe.fileHandleForReading.fileDescriptor
+        let errFD = stderrPipe.fileHandleForReading.fileDescriptor
+        for descriptor in [outFD, errFD] {
+            let flags = fcntl(descriptor, F_GETFL, 0)
+            if flags >= 0 { _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) }
+        }
 
+        var outData = Data()
+        var errData = Data()
+        var buffer = [UInt8](repeating: 0, count: 8_192)
+        var openDescriptors: Set<Int32> = [outFD, errFD]
+        let deadline = Date().addingTimeInterval(timeout)
         var timedOut = false
-        if exited.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
-            process.terminate()
-            if exited.wait(timeout: .now() + 1) == .timedOut {
-                Darwin.kill(process.processIdentifier, SIGKILL)
-                process.waitUntilExit()
+
+        while true {
+            if Date() >= deadline {
+                timedOut = true
+                break
+            }
+            var fds = openDescriptors.sorted().map { descriptor in
+                pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            }
+            if fds.isEmpty {
+                // Both ends closed: the command's output is complete. Give the
+                // process a moment to report its status.
+                if exited.wait(timeout: .now() + .milliseconds(200)) == .success { break }
+                if Date() >= deadline { timedOut = true }
+                if timedOut { break }
+                continue
+            }
+            let ready = poll(&fds, nfds_t(fds.count), 100)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            for entry in fds where entry.revents != 0 {
+                let count = Darwin.read(entry.fd, &buffer, buffer.count)
+                if count > 0 {
+                    if entry.fd == outFD {
+                        outData.append(buffer, count: count)
+                    } else {
+                        errData.append(buffer, count: count)
+                    }
+                } else if count == 0 || (count < 0 && errno != EAGAIN && errno != EINTR) {
+                    openDescriptors.remove(entry.fd)
+                }
             }
         }
-        readers.wait()
 
         if timedOut {
-            var message = errBox.value
-            message.append(Data("\nssh did not respond in time.\n".utf8))
-            return (-2, outBox.value, message)
+            process.terminate()
+            if exited.wait(timeout: .now() + .seconds(1)) == .timedOut {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + .seconds(1))
+            }
+            errData.append(Data("\nssh did not respond in time.\n".utf8))
+            return (-2, outData, errData)
         }
-        return (process.terminationStatus, outBox.value, errBox.value)
+        return (process.terminationStatus, outData, errData)
     }
 }
