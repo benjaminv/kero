@@ -295,6 +295,15 @@ struct ContentView: View {
         }
         .onChange(of: manager.selectedSession?.id) { syncGit() }
         .onChange(of: manager.selectedSession?.workingDirectory) { syncGit() }
+        // The panel directory, not the session's own: a `cd` on a remote
+        // machine moves that and leaves `workingDirectory` alone, so without
+        // this the Git panel kept its old repository until something unrelated
+        // happened to trigger a sync. Files re-roots from the right pane's own
+        // poll, which is why only Git looked stuck.
+        .onChange(of: manager.selectedSession?.panelDirectoryPath) { syncGit() }
+        // A connection going up or down changes which machine the panel should
+        // be reading, even when the directory string happens to be unchanged.
+        .onChange(of: manager.selectedSession?.remoteHeaderState) { syncGit() }
         .onChange(of: manager.selectedSession?.foregroundDirectoryPath) { syncGit() }
         .onChange(of: manager.selectedProject?.customDirectory) { syncGit() }
         .onChange(of: colorScheme) {
