@@ -66,9 +66,52 @@ enum SyntaxHighlighting {
     /// `Theme` (Theme.swift) in this module that would otherwise shadow it.
     @MainActor
     static let theme = STPluginNeonAppKit.Theme(
-        colors: STPluginNeonAppKit.Theme.default.colors,
+        colors: defaultColors(),
         fonts: STPluginNeonAppKit.Theme.Fonts(fonts: [:])
     )
+
+    /// The plugin's default token colors, read one at a time from its resource
+    /// bundle rather than through `Theme.default`, which force-unwraps all
+    /// twenty asset lookups: one nil there traps and takes down every terminal
+    /// in the app. A color kero cannot read is left out instead — the
+    /// highlighter falls back to `plain`, and with none the editor is plain
+    /// text.
+    ///
+    /// A build that overrides `PRODUCT_BUNDLE_IDENTIFIER` on the xcodebuild
+    /// command line reaches exactly that trap: the override applies to the
+    /// package resource bundles too, so they carry the app's identifier and
+    /// their assets no longer resolve.
+    @MainActor
+    private static func defaultColors() -> STPluginNeonAppKit.Theme.Colors {
+        let tokens = [
+            "plain", "boolean", "comment", "constructor", "function.call",
+            "include", "keyword", "keyword.function", "keyword.return",
+            "method", "number", "operator", "parameter",
+            "punctuation.special", "string", "text.literal", "text.title",
+            "type", "variable.builtin", "variable",
+        ]
+        guard let bundle = pluginResourceBundle else {
+            return STPluginNeonAppKit.Theme.Colors(colors: [:])
+        }
+        var colors: [String: NSColor] = [:]
+        for token in tokens {
+            if let color = NSColor(named: "neon.plugin.default/\(token)", bundle: bundle) {
+                colors[token] = color
+            }
+        }
+        return STPluginNeonAppKit.Theme.Colors(colors: colors)
+    }
+
+    /// The plugin's asset bundle inside the app. The package's own
+    /// `Bundle.module` is internal to it, so kero resolves the bundle SwiftPM
+    /// named and copied in beside the executable's other resources.
+    private static let pluginResourceBundle: Bundle? = {
+        guard let url = Bundle.main.url(
+            forResource: "STTextView-Plugin-Neon_STPluginNeonAppKit",
+            withExtension: "bundle"
+        ) else { return nil }
+        return Bundle(url: url)
+    }()
 
     /// A syntax-highlighting plugin for `path`, or `nil` when the file type has
     /// no bundled grammar (the editor then shows plain text).
