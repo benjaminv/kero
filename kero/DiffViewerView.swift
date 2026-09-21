@@ -111,6 +111,9 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     @Published private(set) var isEditable = false
     @Published private(set) var isDirty = false
     @Published var saveError: String?
+    /// Why this file cannot be written, or nil while it is writable. Set when
+    /// the remote machine it lives on is no longer reachable.
+    @Published private(set) var readOnlyReason: String?
 
     let web = DiffWebModel()
 
@@ -129,6 +132,14 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// editor, selection, and undo stack.
     private var editedNewContent = ""
     private var reloadGeneration: UInt = 0
+    /// The workspace this diff reads. The tab keeps its own, so it never
+    /// follows the session onto another machine — and re-binds to a new
+    /// connection to the same machine when one arrives.
+    private var backend: WorkspaceBackend
+    /// The workspace this diff belongs to: nil for this Mac, else the machine
+    /// it was opened from. Part of the tab's identity, so the same path on two
+    /// machines is two tabs, and a diff opened locally is never read-only.
+    let workspaceIdentity: String?
 
     init(
         repoRoot: String,
@@ -138,8 +149,12 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         origPath: String?,
         commitHash: String? = nil,
         commitParentHash: String? = nil,
-        commitStatus: Character? = nil
+        commitStatus: Character? = nil,
+        session: TerminalSession? = nil,
+        backend: WorkspaceBackend? = nil
     ) {
+        self.backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
+        workspaceIdentity = session?.workspaceIdentity
         self.repoRoot = repoRoot
         self.path = path
         self.staged = staged
@@ -157,6 +172,50 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             self?.completeEditing(fileID: fileID, contents: contents)
         }
         reload()
+    }
+
+    /// Whether the file can be edited right now: a regular worktree file whose
+    /// machine is still reachable.
+    var isEditableNow: Bool {
+        isEditable && readOnlyReason == nil
+    }
+
+    // MARK: - Remote workspace
+
+    /// Re-checks this tab against the project's connections: adopts a live
+    /// workspace for its own machine, or marks it read-only. Driven by the
+    /// project rather than by the session the tab was opened from, because a
+    /// user who reconnects in another terminal of the same project is
+    /// reconnecting to the same machine.
+    func reevaluateWorkspace(in project: Project) {
+        guard let workspaceIdentity else { return }
+        guard let live = project.connectedWorkspace(for: workspaceIdentity) else {
+            setReadOnly(true, destination: workspaceIdentity)
+            return
+        }
+        guard readOnlyReason != nil else { return }
+        // A reconnection is a new channel; reading or saving over the old one
+        // fails, so the tab takes the live one.
+        backend = live
+        readOnlyReason = nil
+        web.canEdit = isEditableNow
+        // No-op while the buffer is dirty, so edits made during the outage
+        // survive and can now be saved.
+        reload()
+    }
+
+    private func setReadOnly(_ isReadOnly: Bool, destination: String) {
+        let reason = isReadOnly
+            ? String(
+                localized: "Disconnected from \(destination) — read-only until reconnected",
+                comment: "Diff banner. The placeholder is a remote machine as user@host."
+            )
+            : nil
+        guard readOnlyReason != reason else { return }
+        readOnlyReason = reason
+        // `isEditable` stays the file's own verdict, so an edit made before the
+        // connection dropped is still saveable once it comes back.
+        web.canEdit = isEditableNow
     }
 
     var name: String {
@@ -180,10 +239,19 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             : name
     }
 
+    /// Tab strip and switcher label. A remote diff says which machine it is
+    /// on; a local diff reads exactly as it always has.
+    var tabTitle: String {
+        guard let workspaceIdentity else { return title }
+        return "\(workspaceIdentity): \(title)"
+    }
+
     func reload() {
         // Keep the editor's document and undo history stable until the user
         // leaves edit mode, and never replace an unsaved buffer from disk.
-        guard !isEditing, !isDirty else { return }
+        // While the machine is unreachable both sides can only fail to load,
+        // and an error would replace the diff the user was reading.
+        guard readOnlyReason == nil, !isEditing, !isDirty else { return }
         reloadGeneration &+= 1
         let generation = reloadGeneration
         isLoading = true
@@ -195,58 +263,98 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         let untracked = untracked
         let commitHash = commitHash
 
+        let backend = self.backend
+
         Task { [weak self] in
-            let result = await Task.detached(priority: .userInitiated) {
+            // Git first, on its own thread, exactly as before.
+            let git = await Task.detached(priority: .userInitiated) {
                 var failureVar: String?
-                let unmerged = commitHash == nil && !staged
-                    && Self.isUnmerged(path: path, in: root)
-                let old: String
-                let new: String
-                if let commitHash {
-                    old = Self.firstGitContent(
-                        ["\(commitHash)^:\(oldPath)"], in: root, error: &failureVar
+                // Only a live worktree diff can be unmerged, and the check is
+                // a Git call, so it stays behind that test rather than inside
+                // a short-circuit that cannot await.
+                var unmerged = false
+                if commitHash == nil, !staged {
+                    unmerged = await Self.isUnmerged(
+                        path: path, in: root, backend: backend
                     )
-                    new = Self.firstGitContent(
-                        ["\(commitHash):\(path)"], in: root, error: &failureVar
-                    )
-                } else if staged {
-                    old = Self.firstGitContent(
-                        ["HEAD:\(oldPath)"], in: root, error: &failureVar
-                    )
-                    new = Self.firstGitContent(
-                        [":\(path)"], in: root, error: &failureVar
-                    )
-                } else {
-                    if untracked {
-                        old = ""
-                    } else {
-                        // An unmerged index has no stage-0 `:path`. Prefer our
-                        // side, then the merge base, so conflict rows show a
-                        // meaningful before-side instead of the whole file as new.
-                        old = Self.firstGitContent(
-                            [":\(oldPath)", ":2:\(oldPath)", ":1:\(oldPath)", "HEAD:\(oldPath)"],
-                            in: root,
-                            error: &failureVar
-                        )
-                    }
-                    new = Self.readWorktreeFile(root: root, path: path, error: &failureVar)
                 }
-                let editable = commitHash == nil && !staged
-                    && Self.isEditableWorktreeFile(root: root, path: path)
+                // A later side must not clear an earlier side's failure, so
+                // each result only overwrites it when it carries one.
+                func take(_ result: (text: String, error: String?)) -> String {
+                    if let error = result.error { failureVar = error }
+                    return result.text
+                }
+                let old: String
+                // Non-nil only when git supplies the "after" side too; a live
+                // worktree diff reads that side from the workspace below.
+                var newFromGit: String?
+                if let commitHash {
+                    old = take(await Self.firstGitContent(
+                        ["\(commitHash)^:\(oldPath)"], in: root, backend: backend
+                    ))
+                    newFromGit = take(await Self.firstGitContent(
+                        ["\(commitHash):\(path)"], in: root, backend: backend
+                    ))
+                } else if staged {
+                    old = take(await Self.firstGitContent(
+                        ["HEAD:\(oldPath)"], in: root, backend: backend
+                    ))
+                    newFromGit = take(await Self.firstGitContent(
+                        [":\(path)"], in: root, backend: backend
+                    ))
+                } else if untracked {
+                    old = ""
+                } else {
+                    // An unmerged index has no stage-0 `:path`. Prefer our
+                    // side, then the merge base, so conflict rows show a
+                    // meaningful before-side instead of the whole file as new.
+                    old = take(await Self.firstGitContent(
+                        [":\(oldPath)", ":2:\(oldPath)", ":1:\(oldPath)", "HEAD:\(oldPath)"],
+                        in: root,
+                        backend: backend
+                    ))
+                }
                 return (
                     old: old,
-                    new: new,
+                    newFromGit: newFromGit,
                     failure: failureVar,
-                    unmerged: unmerged,
-                    editable: editable
+                    unmerged: unmerged
                 )
             }.value
-            guard let self, self.reloadGeneration == generation else { return }
+
+            var failure = git.failure
+            let new: String
+            let editable: Bool
+            if let newFromGit = git.newFromGit {
+                new = newFromGit
+                editable = false
+            } else {
+                let worktree = await Self.readWorktreeFile(
+                    root: root, path: path, backend: backend
+                )
+                new = worktree.text
+                if let error = worktree.error { failure = error }
+                editable = await Self.isEditableWorktreeFile(
+                    root: root, path: path, backend: backend
+                )
+            }
+            let result = (
+                old: git.old,
+                new: new,
+                failure: failure,
+                unmerged: git.unmerged,
+                editable: editable
+            )
+            // The connection may have dropped while these reads were in
+            // flight; their failure must not become the tab's content.
+            guard let self, self.reloadGeneration == generation,
+                  self.readOnlyReason == nil
+            else { return }
             self.isLoading = false
             self.error = result.failure
             self.isUnmerged = result.unmerged
             self.isEditable = result.editable && result.failure == nil
-            self.web.canEdit = self.isEditable
+            self.web.canEdit = self.isEditableNow
             self.web.oldContent = result.old
             self.web.newContent = result.new
             self.savedNewContent = result.new
@@ -303,22 +411,28 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
     }
 
     func setEditing(_ isEditing: Bool) {
-        guard isEditable else { return }
+        guard isEditableNow else { return }
         DiffViewPreferences.shared.prefersEditing = isEditing
     }
 
     private var isEditing: Bool {
-        isEditable && DiffViewPreferences.shared.prefersEditing
+        isEditableNow && DiffViewPreferences.shared.prefersEditing
     }
 
-    func save() {
+    func save() async {
         guard isEditable, isDirty else { return }
-        let fileURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
-            .appendingPathComponent(path)
+        // Refused, not silently dropped: the save-error bar says why.
+        if let readOnlyReason {
+            saveError = readOnlyReason
+            return
+        }
+        let filePath = (repoRoot as NSString).appendingPathComponent(path)
+        let written = editedNewContent
         do {
-            try editedNewContent.write(to: fileURL, atomically: true, encoding: .utf8)
-            savedNewContent = editedNewContent
-            isDirty = false
+            try await backend.write(path: filePath, data: Data(written.utf8))
+            savedNewContent = written
+            // An edit landing while the write was in flight stays dirty.
+            isDirty = editedNewContent != savedNewContent
             saveError = nil
         } catch {
             saveError = error.localizedDescription
@@ -332,32 +446,38 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         case tooLarge
     }
 
+    /// The first spec that exists, and the reason the diff cannot be shown if
+    /// one of them is unusable. The error is returned rather than written
+    /// through `inout` so it cannot cross a suspension point, and so a caller
+    /// reading two sides only overwrites its failure on a real one.
     private nonisolated static func firstGitContent(
-        _ specs: [String], in root: String, error: inout String?
-    ) -> String {
+        _ specs: [String], in root: String, backend: WorkspaceBackend
+    ) async -> (text: String, error: String?) {
         for spec in specs {
-            switch gitContent(spec, in: root) {
+            switch await gitContent(spec, in: root, backend: backend) {
             case .missing:
                 continue
             case .content(let content):
-                return content
+                return (content, nil)
             case .binary:
-                error = String(localized: "Binary file")
-                return ""
+                return ("", String(localized: "Binary file"))
             case .tooLarge:
-                error = String(localized: "File is too large to diff")
-                return ""
+                return ("", String(localized: "File is too large to diff"))
             }
         }
-        return ""
+        return ("", nil)
     }
 
-    private nonisolated static func gitContent(_ spec: String, in root: String) -> GitContent {
-        let size = GitStatusModel.runGit(["cat-file", "-s", spec], in: root)
+    private nonisolated static func gitContent(
+        _ spec: String, in root: String, backend: WorkspaceBackend
+    ) async -> GitContent {
+        let size = await GitStatusModel.runGit(
+            ["cat-file", "-s", spec], in: root, backend: backend
+        )
         guard size.status == 0 else { return .missing }
         let byteCount = Int(size.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         guard byteCount <= maxBytes else { return .tooLarge }
-        let run = runGitData(["cat-file", "blob", spec], in: root)
+        let run = await runGitData(["cat-file", "blob", spec], in: root, backend: backend)
         guard run.status == 0 else { return .missing }
         guard run.stdout.count <= maxBytes else { return .tooLarge }
         guard !run.stdout.contains(0),
@@ -366,6 +486,18 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
             return .binary
         }
         return .content(content)
+    }
+
+    /// The same bytes from a workspace that may not be this machine. A local
+    /// workspace keeps the launcher below, whose capture limit and reader
+    /// priorities the generic backend does not reproduce.
+    private nonisolated static func runGitData(
+        _ args: [String], in root: String, backend: WorkspaceBackend
+    ) async -> (status: Int32, stdout: Data, stderr: String) {
+        if backend is LocalWorkspaceBackend {
+            return runGitData(args, in: root)
+        }
+        return await GitStatusModel.remoteGitData(args, in: root, backend: backend)
     }
 
     /// GitStatusModel's general runner intentionally exposes decoded text.
@@ -442,79 +574,55 @@ final class DiffTab: nonisolated ObservableObject, nonisolated Identifiable {
         )
     }
 
-    private nonisolated static func isUnmerged(path: String, in root: String) -> Bool {
-        let run = GitStatusModel.runGit(
-            ["--literal-pathspecs", "ls-files", "--unmerged", "--", path], in: root
+    private nonisolated static func isUnmerged(
+        path: String, in root: String, backend: WorkspaceBackend
+    ) async -> Bool {
+        let run = await GitStatusModel.runGit(
+            ["--literal-pathspecs", "ls-files", "--unmerged", "--", path],
+            in: root, backend: backend
         )
         return run.status == 0 && !run.stdout.isEmpty
     }
 
     /// Editing is limited to regular worktree files. In particular, writing a
     /// symlink atomically would replace the link itself with a regular file.
-    private nonisolated static func isEditableWorktreeFile(root: String, path: String) -> Bool {
-        let url = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(path)
-        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              (attributes[.type] as? FileAttributeType) == .typeRegular
-        else { return false }
-        return true
+    private nonisolated static func isEditableWorktreeFile(
+        root: String, path: String, backend: WorkspaceBackend
+    ) async -> Bool {
+        let filePath = (root as NSString).appendingPathComponent(path)
+        guard let stat = try? await backend.stat(path: filePath) else { return false }
+        return !stat.isSymlink && stat.isRegular
     }
 
     private nonisolated static func readWorktreeFile(
-        root: String, path: String, error: inout String?
-    ) -> String {
-        let url = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(path)
-        let fm = FileManager.default
-        if let destination = try? fm.destinationOfSymbolicLink(atPath: url.path) {
-            guard destination.utf8.count <= maxBytes else {
-                error = String(localized: "File is too large to diff")
-                return ""
+        root: String, path: String, backend: WorkspaceBackend
+    ) async -> (text: String, error: String?) {
+        let filePath = (root as NSString).appendingPathComponent(path)
+        let symlink = (try? await backend.readSymlinkDestination(path: filePath)) ?? nil
+        if let symlink {
+            guard symlink.utf8.count <= maxBytes else {
+                return ("", String(localized: "File is too large to diff"))
             }
-            return destination
+            return (symlink, nil)
         }
         do {
-            // Keep one descriptor for the whole read: replacing the path while
-            // an agent writes cannot redirect us to a different, larger file.
-            // Seek checks catch growth without ever loading more than maxBytes.
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
-            let initialSize = try handle.seekToEnd()
-            guard initialSize <= UInt64(maxBytes) else {
-                error = String(localized: "File is too large to diff")
-                return ""
-            }
-            try handle.seek(toOffset: 0)
-
-            var data = Data()
-            while data.count < maxBytes {
-                let remaining = min(64 * 1024, maxBytes - data.count)
-                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else {
-                    break
-                }
-                data.append(chunk)
-            }
-            let finalSize = try handle.seekToEnd()
-            guard finalSize <= UInt64(maxBytes) else {
-                error = String(localized: "File is too large to diff")
-                return ""
-            }
+            let data = try await backend.read(path: filePath, maxBytes: maxBytes)
             guard !data.contains(0),
                   let text = String(data: data, encoding: .utf8)
             else {
-                error = String(localized: "Binary file")
-                return ""
+                return ("", String(localized: "Binary file"))
             }
-            return text
-        } catch let readError as CocoaError
-            where readError.code == .fileNoSuchFile || readError.code == .fileReadNoSuchFile {
+            return (text, nil)
+        } catch WorkspaceError.tooLarge {
+            return ("", String(localized: "File is too large to diff"))
+        } catch WorkspaceError.notFound {
             // Deleted from the worktree: an empty "after" side is the diff.
-            return ""
-        } catch let fileError {
-            error = String(
-                localized: "Unable to read file: \(fileError.localizedDescription)",
+            return ("", nil)
+        } catch {
+            return ("", String(
+                localized: "Unable to read file: \(error.localizedDescription)",
                 comment: "Diff error followed by a system-provided error description."
-            )
-            return ""
+            ))
         }
     }
 }
@@ -695,6 +803,10 @@ struct DiffViewerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let reason = diff.readOnlyReason {
+                RemoteReadOnlyBanner(message: reason)
+                    .frame(height: 22)
+            }
             if diff.isUnmerged {
                 conflictBanner
             }
@@ -783,10 +895,10 @@ struct DiffViewerView: View {
                 set: { diff.setDiffStyle($0) }
             ),
             isEditing: Binding(
-                get: { diff.isEditable && preferences.prefersEditing },
+                get: { diff.isEditableNow && preferences.prefersEditing },
                 set: { diff.setEditing($0) }
             ),
-            canEdit: diff.isEditable
+            canEdit: diff.isEditableNow
         )
         .frame(height: DiffViewerLayout.controlsHeight)
     }

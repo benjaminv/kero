@@ -20,6 +20,9 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         case text
         case image(NSImage)
         case unavailable(String)
+        /// Waiting for the first read. Only reachable on a workspace that
+        /// cannot answer immediately, since this tab is created synchronously.
+        case loading
     }
 
     private(set) var content: Content
@@ -39,6 +42,9 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
 
     @Published private(set) var isDirty = false
     @Published var saveError: String?
+    /// Why this file cannot be written, or nil while it is writable. Set when
+    /// the remote machine it lives on is no longer reachable.
+    @Published private(set) var readOnlyReason: String?
     /// Changes only when a clean tab picks up different bytes from disk. Text
     /// editors use this as their identity so an already-mounted pane is rebuilt
     /// with the new content while preserving its stored cursor/scroll state.
@@ -56,6 +62,14 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     private var imageFingerprint: Int?
     private var reloadGeneration: UInt = 0
     private var reloadTask: Task<Void, Never>?
+    /// The workspace this file lives on. The tab keeps its own, so it never
+    /// follows the session onto another machine — and re-binds to a new
+    /// connection to the same machine when one arrives.
+    private var backend: WorkspaceBackend
+    /// The workspace this file belongs to: nil for this Mac, else the machine
+    /// it was opened from. Part of the tab's identity, so the same path on two
+    /// machines is two tabs, and a file opened locally is never read-only.
+    let workspaceIdentity: String?
 
     private struct LoadedContent {
         let content: Content
@@ -63,17 +77,75 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         let imageFingerprint: Int?
     }
 
-    init(path: String) {
+    init(
+        path: String,
+        session: TerminalSession? = nil,
+        backend: WorkspaceBackend? = nil
+    ) {
         self.path = path
-        let loaded = Self.load(path: path)
-        content = loaded.content
-        text = loaded.text
-        savedText = loaded.text
-        imageFingerprint = loaded.imageFingerprint
+        // Files opened from a remote session keep reading and writing over
+        // that connection even while the panels follow another session.
+        let backend = backend ?? session?.workspaceBackend ?? LocalWorkspaceBackend.shared
+        self.backend = backend
+        workspaceIdentity = session?.workspaceIdentity
+        // This initializer is synchronous (a file opens from a menu, a click,
+        // or session restore), so a workspace that can answer immediately does
+        // so here rather than flashing a placeholder on every open.
+        let loaded = (backend as? LocalWorkspaceBackend).map {
+            Self.loadedContent(path: path, data: $0.readImmediately(path: path))
+        }
+        content = loaded?.content ?? .loading
+        text = loaded?.text ?? ""
+        savedText = loaded?.text ?? ""
+        imageFingerprint = loaded?.imageFingerprint
+        if case .loading = content {
+            reloadFromDiskIfClean()
+        }
+    }
+
+    // MARK: - Remote workspace
+
+    /// Re-checks this tab against the project's connections: adopts a live
+    /// workspace for its own machine, or marks it read-only. Driven by the
+    /// project rather than by the session the tab was opened from, because a
+    /// user who reconnects in another terminal of the same project is
+    /// reconnecting to the same machine.
+    func reevaluateWorkspace(in project: Project) {
+        guard let workspaceIdentity else { return }
+        guard let live = project.connectedWorkspace(for: workspaceIdentity) else {
+            setReadOnly(true, destination: workspaceIdentity)
+            return
+        }
+        guard readOnlyReason != nil else { return }
+        // A reconnection is a new channel; reading or saving over the old one
+        // fails, so the tab takes the live one.
+        backend = live
+        readOnlyReason = nil
+        // No-op while the buffer is dirty, so edits made during the outage
+        // survive and can now be saved.
+        reloadFromDiskIfClean()
+    }
+
+    private func setReadOnly(_ isReadOnly: Bool, destination: String) {
+        let reason = isReadOnly
+            ? String(
+                localized: "Disconnected from \(destination) — read-only until reconnected",
+                comment: "Editor banner. The placeholder is a remote machine as user@host."
+            )
+            : nil
+        guard readOnlyReason != reason else { return }
+        readOnlyReason = reason
     }
 
     var name: String {
         (path as NSString).lastPathComponent
+    }
+
+    /// Tab strip and switcher label. A remote file says which machine it is
+    /// on; a local file reads exactly as it always has.
+    var tabTitle: String {
+        guard let workspaceIdentity else { return name }
+        return "\(workspaceIdentity): \(name)"
     }
 
     /// Re-points this tab at a new location after the file (or a directory
@@ -105,13 +177,20 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         }
     }
 
-    func save() {
+    func save() async {
         guard case .text = content, isDirty else { return }
+        // Refused, not silently dropped: the save-error bar says why.
+        if let readOnlyReason {
+            saveError = readOnlyReason
+            return
+        }
         invalidateReload()
+        let written = text
         do {
-            try text.write(toFile: path, atomically: true, encoding: .utf8)
-            savedText = text
-            isDirty = false
+            try await backend.write(path: path, data: Data(written.utf8))
+            savedText = written
+            // An edit landing while the write was in flight stays dirty.
+            refreshDirtyState()
             saveError = nil
         } catch {
             saveError = error.localizedDescription
@@ -122,21 +201,26 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
     /// the main actor; generation/path/dirty guards keep an older read from
     /// winning over a rename, save, or edit performed while it was in flight.
     func reloadFromDiskIfClean() {
-        guard !isDirty else { return }
+        // While the file's machine is unreachable a read can only fail, and
+        // replacing the content with "Could not read file" would throw away
+        // what the user was looking at. The banner already says why.
+        guard readOnlyReason == nil, !isDirty else { return }
         reloadTask?.cancel()
         reloadGeneration &+= 1
         let generation = reloadGeneration
         let expectedPath = path
 
+        let backend = self.backend
         reloadTask = Task { [weak self] in
-            let data = await Task.detached(priority: .userInitiated) {
-                Self.readData(path: expectedPath)
-            }.value
+            let data = try? await backend.read(path: expectedPath, maxBytes: .max)
             guard !Task.isCancelled,
                   let self,
                   self.reloadGeneration == generation,
                   self.path == expectedPath,
-                  !self.isDirty
+                  !self.isDirty,
+                  // The connection may have dropped while this read was in
+                  // flight; its failure must not become the tab's content.
+                  self.readOnlyReason == nil
             else { return }
 
             let loaded = Self.loadedContent(path: expectedPath, data: data)
@@ -167,14 +251,6 @@ final class FileTab: nonisolated ObservableObject, nonisolated Identifiable {
         default:
             return false
         }
-    }
-
-    private static func load(path: String) -> LoadedContent {
-        loadedContent(path: path, data: readData(path: path))
-    }
-
-    private nonisolated static func readData(path: String) -> Data? {
-        try? Data(contentsOf: URL(fileURLWithPath: path))
     }
 
     private static func loadedContent(path: String, data: Data?) -> LoadedContent {
@@ -233,6 +309,10 @@ struct FileViewerView: View {
             switch file.content {
             case .text:
                 VStack(spacing: 0) {
+                    if let reason = file.readOnlyReason {
+                        RemoteReadOnlyBanner(message: reason)
+                            .frame(height: 22)
+                    }
                     if let error = file.saveError {
                         saveErrorBar(error)
                     }
@@ -252,6 +332,9 @@ struct FileViewerView: View {
                     Image(nsImage: image)
                         .padding(16)
                 }
+            case .loading:
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let reason):
                 VStack(spacing: 8) {
                     MaterialFileIconView(path: file.path, size: 28, opacity: 0.72)

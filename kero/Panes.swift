@@ -41,9 +41,9 @@ extension PaneContent {
     @MainActor var title: String {
         switch self {
         case .session(let session): return session.title
-        case .file(let file): return file.name
+        case .file(let file): return file.tabTitle
         case .browser(let browser): return browser.title
-        case .diff(let diff): return diff.title
+        case .diff(let diff): return diff.tabTitle
         }
     }
 
@@ -82,10 +82,10 @@ extension PaneContent {
         }
     }
 
-    @MainActor func save() {
+    @MainActor func save() async {
         switch self {
-        case .file(let file): file.save()
-        case .diff(let diff): diff.save()
+        case .file(let file): await file.save()
+        case .diff(let diff): await diff.save()
         case .session, .browser: break
         }
     }

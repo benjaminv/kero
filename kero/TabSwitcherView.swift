@@ -750,6 +750,8 @@ private struct TabPaneThumbnail: View {
                 .resizable()
                 .scaledToFit()
                 .padding(5)
+        case .loading:
+            Color.clear
         case .unavailable(let reason):
             VStack(spacing: 4) {
                 MaterialFileIconView(path: file.path, size: 18, opacity: 0.82)

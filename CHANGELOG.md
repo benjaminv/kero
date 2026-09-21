@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Work on a remote machine over SSH: when a terminal pane runs `ssh`, the Files, Git, and Info panels, the editor, and the diff viewer follow the remote machine and its working directory, remote listening ports can be forwarded and opened locally, and open remote files stay readable but read-only if the connection drops
+
 ## [0.1.47]
 
 - Let dictation and other accessibility tools enter text in terminal panes

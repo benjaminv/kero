@@ -295,6 +295,15 @@ struct ContentView: View {
         }
         .onChange(of: manager.selectedSession?.id) { syncGit() }
         .onChange(of: manager.selectedSession?.workingDirectory) { syncGit() }
+        // The panel directory, not the session's own: a `cd` on a remote
+        // machine moves that and leaves `workingDirectory` alone, so without
+        // this the Git panel kept its old repository until something unrelated
+        // happened to trigger a sync. Files re-roots from the right pane's own
+        // poll, which is why only Git looked stuck.
+        .onChange(of: manager.selectedSession?.panelDirectoryPath) { syncGit() }
+        // A connection going up or down changes which machine the panel should
+        // be reading, even when the directory string happens to be unchanged.
+        .onChange(of: manager.selectedSession?.remoteHeaderState) { syncGit() }
         .onChange(of: manager.selectedSession?.foregroundDirectoryPath) { syncGit() }
         .onChange(of: manager.selectedProject?.customDirectory) { syncGit() }
         .onChange(of: colorScheme) {
@@ -327,11 +336,21 @@ struct ContentView: View {
             git.sync(root: "")
             return
         }
-        let root = project.panelRoot(
-            followingSessionAt: session.currentDirectoryPath,
-            foregroundAt: session.foregroundDirectoryPath
-        ).root
-        git.sync(root: root)
+        // The remote shell's directory once the session is connected, and the
+        // matching workspace, so the panel reads the repository on the machine
+        // the terminal is actually in. Resolving the root is a round trip
+        // there, hence the task.
+        let backend = session.workspaceBackend
+        let cwd = session.panelDirectoryPath
+        let foreground = session.foregroundDirectoryPath
+        Task {
+            let root = await project.panelRoot(
+                followingSessionAt: cwd,
+                foregroundAt: foreground,
+                backend: backend
+            ).root
+            git.sync(root: root, backend: backend)
+        }
     }
 
     @ViewBuilder

@@ -29,6 +29,15 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// reconciles foreground process identity with explicit lifecycle events.
     @Published var agentStatus: KeroAgentStatus?
 
+    /// Where this session's right pane looks. Set by Kero's `ssh` helper
+    /// through the automation socket, never guessed from the foreground
+    /// process: an ssh Kero did not front cannot be followed.
+    @Published var location: WorkspaceLocation = .local
+    /// The connection this session most recently left. Open editor tabs use it
+    /// to recognise their own remote after `exit` has returned the pane to the
+    /// local machine.
+    @Published private(set) var lastRemoteConnection: RemoteConnection?
+
     /// The emulator driving this session. Fixed for the session's lifetime —
     /// changing the setting only affects terminals opened afterwards.
     let backend: TerminalBackend
@@ -45,6 +54,17 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     private let launchDirectoryURL: URL?
     private let shellPidFileURL: URL?
     private var cachedShellPid: pid_t?
+    /// True when this session's shell was started with Kero's zsh
+    /// integration. A session that had it and still ends up running a stock
+    /// ssh directly means the integration did not take, which the pane says
+    /// out loud rather than leaving the user to wonder.
+    private let zshIntegrationActive: Bool
+    /// When the current foreground ssh was first seen. A remote command like
+    /// `ssh host uptime` is a foreground ssh too, and it finishes in well under
+    /// a second; announcing it would flash the pane for no reason.
+    private var unmanagedSSHFirstSeen: (pid: pid_t, at: Date)?
+    private var remoteMonitor: Task<Void, Never>?
+    private var remoteObservation: AnyCancellable?
     private var lastHistorySnapshot: String?
     private var isTerminating = false
     private var commandExecutionStartedAtNanos: UInt64?
@@ -65,6 +85,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         let directory = Self.validWorkingDirectory(initialDirectory)
         let artifacts = Self.makeLaunchArtifacts(restoredHistory: restoredHistory)
         let backend = AppSettings.shared.terminalBackend
+        let environment = Self.surfaceEnvironment(
+            pathOverride: environmentPath,
+            sessionID: sessionID,
+            shellPath: shellPath
+        )
         let script = Self.makeLaunchScript(
             backend: backend,
             shellPath: shellPath,
@@ -77,13 +102,11 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             arguments: ["-c", script],
             commandLine: "/bin/sh -c \(Self.shellQuote(script))",
             workingDirectory: directory,
-            environment: Self.surfaceEnvironment(
-                pathOverride: environmentPath,
-                sessionID: sessionID
-            )
+            environment: environment
         )
 
         id = sessionID
+        zshIntegrationActive = environment["ZDOTDIR"] != nil
         self.shellPath = shellPath
         self.backend = backend
         launchWorkingDirectory = directory
@@ -197,9 +220,154 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     }
 
     private func removeLaunchArtifacts() {
+        endRemoteConnection(reason: "terminal closed")
         KeroCLIService.shared.revokeTerminal(id: id)
         guard let launchDirectoryURL else { return }
         try? FileManager.default.removeItem(at: launchDirectoryURL)
+    }
+
+    // MARK: - Remote workspace
+
+    /// Adopts the connection Kero's `ssh` helper just announced and starts
+    /// watching it. Exactly one connection per session: an `ssh` typed from
+    /// inside an already-remote shell is nested and is not followed.
+    @discardableResult
+    func beginRemoteConnection(_ connection: RemoteConnection) -> Bool {
+        // A live connection means this ssh was typed from inside the remote
+        // shell. That is nested and Kero does not follow it. A connection that
+        // has already finished is simply the previous one, and the session is
+        // free to go remote again.
+        if let existing = location.remoteConnection, existing.state != .disconnected {
+            NSLog(
+                "kero: ignoring nested ssh in terminal %@ (already remote)",
+                id.uuidString
+            )
+            return false
+        }
+        endRemoteConnection(reason: "replaced by a new connection")
+        location = .remote(connection)
+        // The connection is its own observable object, so republish its
+        // changes or views bound to the session never see a state change.
+        remoteObservation = connection.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        remoteMonitor = Task { [weak self] in
+            await self?.watchRemoteConnection(connection)
+        }
+        return true
+    }
+
+    func endRemoteConnection(reason: String) {
+        remoteMonitor?.cancel()
+        remoteMonitor = nil
+        remoteObservation = nil
+        guard let connection = location.remoteConnection else { return }
+        connection.markDisconnected(reason: reason)
+        lastRemoteConnection = connection
+    }
+
+    /// The pane returns to the local machine only when the ssh process itself
+    /// is gone, which is what `exit` does. A connection that drops while ssh is
+    /// still running keeps the pane remote and disconnected on purpose: falling
+    /// back to local paths under a remote heading is the one outcome to avoid.
+    private func returnToLocal(_ connection: RemoteConnection, reason: String) {
+        connection.markDisconnected(reason: reason)
+        lastRemoteConnection = connection
+        location = .local
+        remoteObservation = nil
+    }
+
+    /// One check a second. While connecting, only the ssh process going away
+    /// is a failure: the control socket does not exist until authentication
+    /// finishes, and a password or a hardware key can take a while.
+    private func watchRemoteConnection(_ connection: RemoteConnection) async {
+        var tick = 0
+        var consecutiveFailures = 0
+
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if Task.isCancelled { return }
+
+            // The only way back to the local machine is the ssh process
+            // ending, which is what `exit` does.
+            guard connection.isSSHProcessAlive else {
+                returnToLocal(connection, reason: "ssh process exited")
+                return
+            }
+            // The master removes its socket when it goes; cheaper than asking.
+            guard connection.controlSocketExists else {
+                connection.markDisconnected(reason: "control socket removed")
+                continue
+            }
+
+            if connection.state == .connecting {
+                guard await connection.check() else { continue }
+                connection.markConnected()
+                // Probe at once rather than waiting a tick: the pane only
+                // switches to the remote once a directory is known.
+                await probeRemoteWorkingDirectory(connection)
+                continue
+            }
+
+            tick += 1
+            // Every 2 s while healthy, but every second once a probe has
+            // failed: the second opinion that confirms a drop should not wait
+            // out a full cycle when the pane is already showing stale state.
+            guard tick.isMultiple(of: 2) || consecutiveFailures > 0 else { continue }
+
+            // One real round trip every 2 s. This is the liveness test, not
+            // `-O check`: the multiplexing master runs on this Mac and keeps
+            // answering while the network is down, so only a command that
+            // reaches the other machine can tell a live link from a dead one.
+            if await probeRemoteWorkingDirectory(connection) {
+                consecutiveFailures = 0
+                if connection.state == .disconnected {
+                    connection.markConnected()
+                }
+                continue
+            }
+
+            consecutiveFailures += 1
+            // Two in a row before saying so: a single timeout can be a busy
+            // remote or a slow link, and a pane that flickers is worse than
+            // one that takes a few seconds to tell the truth.
+            if consecutiveFailures >= 2, connection.state == .connected {
+                connection.markDisconnected(reason: "no reply from the remote machine")
+            }
+        }
+    }
+
+    /// Finds the remote shell's directory and process id over the shared
+    /// channel. Returns whether the round trip succeeded, which is what tells
+    /// a live connection from a dropped one.
+    ///
+    /// A miss keeps the last known values: the lookup can fail transiently
+    /// while a command is running, and the pane must keep describing the
+    /// remote machine rather than falling back to this Mac's paths.
+    @discardableResult
+    private func probeRemoteWorkingDirectory(
+        _ connection: RemoteConnection
+    ) async -> Bool {
+        let found: (pid: pid_t, directory: String)?
+        do {
+            // Only a thrown error means the round trip failed. `try?` would
+            // flatten "the remote answered, the shell was not found" into the
+            // same nil as "the remote never answered", and the pane would
+            // report a drop that had not happened.
+            found = try await connection.livenessBackend.remoteWorkingDirectory(
+                terminalTag: id.uuidString
+            )
+        } catch {
+            return false
+        }
+        guard let found, !found.directory.isEmpty else { return true }
+        if connection.workingDirectory != found.directory {
+            connection.workingDirectory = found.directory
+        }
+        if connection.shellProcessID != found.pid {
+            connection.shellProcessID = found.pid
+        }
+        return true
     }
 
     /// Short label for the sidebar: the tail of the current directory, if known.
@@ -231,6 +399,9 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
     /// keeps describing the old tree. This is deliberately a separate fact:
     /// `currentDirectoryPath` must stay true to the shell.
     var foregroundDirectoryPath: String? {
+        // While the session is remote this would be the ssh client's own local
+        // directory, which means nothing on the other machine.
+        guard location.remoteConnection == nil else { return nil }
         guard let foreground = surface.foregroundPid, foreground > 0,
               foreground != shellPid
         else { return nil }
@@ -293,11 +464,113 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
         return value
     }
 
+    /// The workspace the right pane, editor and diff viewer operate on for
+    /// this session. Always the Mac's own disk today; a session ssh'd into a
+    /// remote machine will answer with a backend that runs over that channel.
+    var workspaceBackend: WorkspaceBackend {
+        guard let connection = connectedRemote else { return LocalWorkspaceBackend.shared }
+        return connection.workspaceBackend
+    }
+
+    /// The directory the right pane, editor and diff viewer work in. The same
+    /// as ``currentDirectoryPath`` locally, and the remote shell's directory
+    /// once this session is connected to another machine.
+    ///
+    /// Deliberately separate from ``currentDirectoryPath``, which seeds new
+    /// local terminals and the saved session snapshot and must stay a path on
+    /// this Mac.
+    var panelDirectoryPath: String {
+        guard let directory = connectedRemote?.workingDirectory else {
+            return currentDirectoryPath
+        }
+        return directory
+    }
+
+    /// What the right pane's heading should say for this session.
+    ///
+    /// The `unmanaged` case is the one Kero cannot serve: an ssh is running in
+    /// the foreground but it did not come through Kero's helper, so there is no
+    /// channel to work over. Saying so is better than showing this Mac's files
+    /// under the remote's name.
+    var remoteHeaderState: RemotePaneHeaderState {
+        // A connection of Kero's own always describes itself, whatever is in
+        // the foreground.
+        if location.remoteConnection != nil {
+            unmanagedSSHFirstSeen = nil
+            return RemotePaneHeaderView.headerState(for: location)
+        }
+        guard let foreground = unmanagedSSH?.pid else {
+            unmanagedSSHFirstSeen = nil
+            return .local
+        }
+        // Only speak up once this ssh has held the foreground across two
+        // refreshes. Anything shorter is a command, not a session.
+        if let seen = unmanagedSSHFirstSeen, seen.pid == foreground {
+            guard Date().timeIntervalSince(seen.at) >= Self.unmanagedSSHGrace else {
+                return .local
+            }
+        } else {
+            unmanagedSSHFirstSeen = (foreground, Date())
+            return .local
+        }
+        // Two opposite situations: the user deliberately ran their own ssh
+        // client, or Kero's integration was active and silently did not take.
+        return sshHelperWasBypassed ? .helperBypassed : .unmanaged
+    }
+
+    /// Two panel refreshes at the existing 2 s cadence.
+    private static let unmanagedSSHGrace: TimeInterval = 2
+
+    /// True when the foreground job is an ssh client Kero is not in front of.
+    /// The kernel-reported image is used rather than the tab title, which is
+    /// terminal output the remote can write.
+    /// A foreground ssh that did not come through Kero, with its executable.
+    private var unmanagedSSH: (pid: pid_t, path: String)? {
+        guard let foreground = surface.foregroundPid, foreground > 0,
+              foreground != shellPid,
+              let path = processExecutablePath(pid: foreground),
+              (path as NSString).lastPathComponent == "ssh"
+        else { return nil }
+        return (foreground, path)
+    }
+
+    /// True when this session had Kero's zsh integration and a stock ssh ran
+    /// anyway. The integration is meant to make that impossible, so saying so
+    /// turns a silent failure into a visible one.
+    var sshHelperWasBypassed: Bool {
+        zshIntegrationActive && unmanagedSSH?.path == "/usr/bin/ssh"
+    }
+
+    /// The shell the right pane should describe: the remote login shell while
+    /// this session is connected to another machine, and this Mac's own shell
+    /// otherwise. The Info panel filters processes by it, so handing it the
+    /// local pid while remote makes the panel describe a machine it is not
+    /// looking at.
+    var panelShellPid: pid_t? {
+        connectedRemote?.shellProcessID ?? shellPid
+    }
+
+    /// The remote this session is working on. Both the backend and the panel
+    /// path read this, so the pane can never pair a remote backend with a
+    /// local path or the reverse.
+    ///
+    /// Deliberately not restricted to `.connected`. A dropped connection keeps
+    /// describing the remote machine with its last known directory: showing
+    /// this Mac's files under a remote heading is the one outcome to avoid,
+    /// and remote work simply fails while the link is down.
+    private var connectedRemote: RemoteConnection? {
+        guard let connection = location.remoteConnection,
+              connection.workingDirectory != nil
+        else { return nil }
+        return connection
+    }
+
     // MARK: - Launch
 
     private static func surfaceEnvironment(
         pathOverride: String?,
-        sessionID: UUID
+        sessionID: UUID,
+        shellPath: String
     ) -> [String: String] {
         var environment = [
             "TERM": "xterm-256color",
@@ -307,11 +580,56 @@ final class TerminalSession: NSObject, nonisolated ObservableObject, nonisolated
             KeroCLIService.shared.terminalEnvironment(for: sessionID),
             uniquingKeysWith: { _, cliValue in cliValue }
         )
+        environment.merge(
+            zshIntegrationEnvironment(shellPath: shellPath),
+            uniquingKeysWith: { _, integrationValue in integrationValue }
+        )
         if let pathOverride, !pathOverride.isEmpty {
             environment["PATH"] = pathOverride
         }
         // Locale belongs to the user's shell environment. Kero's app language
         // must never synthesize or override LANG/LC_* for terminal processes.
+        return environment
+    }
+
+    /// Points zsh at Kero's own startup directory.
+    ///
+    /// The bundled `.zshenv` restores the user's `ZDOTDIR` and sources their
+    /// files before doing anything, so their shell starts exactly as it would
+    /// otherwise; it then adds an interactive `ssh` function that routes
+    /// through Kero's helper.
+    ///
+    /// This replaces shadowing `ssh` on `PATH`, which cannot work on macOS:
+    /// `/etc/zprofile` runs `path_helper`, which rebuilds `PATH` with the
+    /// system directories first and leaves anything Kero prepended behind
+    /// `/usr/bin`. A shell function is also the better tool, because it
+    /// applies only to what the user types and never to scripts or agents.
+    private static func zshIntegrationEnvironment(
+        shellPath: String
+    ) -> [String: String] {
+        guard (shellPath as NSString).lastPathComponent == "zsh",
+              let resources = Bundle.main.resourceURL,
+              let executables = Bundle.main.executableURL?.deletingLastPathComponent()
+        else { return [:] }
+
+        let directory = resources
+            .appendingPathComponent("shell-integration/zsh", isDirectory: true)
+        guard FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(".zshenv").path
+        ) else { return [:] }
+
+        var environment = [
+            "ZDOTDIR": directory.path,
+            // argv[0] must still be `ssh`, so this names the symlink rather
+            // than the app binary it points at.
+            "KERO_SSH_HELPER": executables.appendingPathComponent("ssh").path,
+        ]
+        // Only set when the user had one, so the bundled file can tell
+        // "restore this" from "there was none".
+        if let existing = ProcessInfo.processInfo.environment["ZDOTDIR"],
+           !existing.isEmpty {
+            environment["KERO_ZSH_ZDOTDIR"] = existing
+        }
         return environment
     }
 

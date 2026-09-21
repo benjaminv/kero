@@ -6,6 +6,85 @@
 import AppKit
 import SwiftUI
 
+/// Serialises the right pane's refreshes. Reading a panel costs a round trip
+/// per directory on a remote workspace, so a tick arriving while one refresh
+/// is in flight is folded into a single further pass rather than running
+/// alongside it — and never dropped, so a `cd` mid-refresh still lands.
+@MainActor
+private final class PanelSyncQueue {
+    private var isRunning = false
+    private var pending = false
+
+    func run(_ body: @escaping () async -> Void) {
+        if isRunning {
+            pending = true
+            return
+        }
+        isRunning = true
+        Task { @MainActor in
+            repeat {
+                pending = false
+                await body()
+            } while pending
+            isRunning = false
+        }
+    }
+}
+
+/// One ``PortForwardController`` per remote connection, kept while the pane
+/// lives so a forward opened from a port row is still known after the user
+/// switches panels and comes back. The connection is held weakly: its
+/// forwards die with it, so a finished connection's entry is dropped.
+@MainActor
+private final class PortForwardRegistry {
+    private struct Entry {
+        weak var connection: RemoteConnection?
+        let controller: PortForwardController
+    }
+
+    private var entries: [UUID: Entry] = [:]
+
+    func controller(for connection: RemoteConnection?) -> PortForwardController? {
+        entries = entries.filter { $0.value.connection != nil }
+        guard let connection else { return nil }
+        if let existing = entries[connection.id]?.controller { return existing }
+        let controller = PortForwardController(connection: connection)
+        entries[connection.id] = Entry(connection: connection, controller: controller)
+        return controller
+    }
+}
+
+/// Hosts the pane's remote heading, which is AppKit and outlives any one
+/// body evaluation — same shape as the diff viewer's web host.
+private struct RemotePaneHeaderHost: NSViewRepresentable {
+    let view: RemotePaneHeaderView
+    let fontScale: CGFloat
+
+    func makeNSView(context: Context) -> NSView {
+        let container = NSView()
+        attach(to: container)
+        return container
+    }
+
+    func updateNSView(_ container: NSView, context: Context) {
+        if view.superview !== container {
+            attach(to: container)
+        }
+        view.fontScale = fontScale
+    }
+
+    private func attach(to container: NSView) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+    }
+}
+
 /// Right sidebar: hidden by default, toggled from the terminal's corner
 /// button or ⇧⌘B. Files/Git switch via tabs along its top, otty-style.
 struct RightSidebarView: View {
@@ -18,7 +97,36 @@ struct RightSidebarView: View {
     @State private var applicationIsActive = NSApp.isActive
     /// Which rule produced the current panel root; drives the Files badge.
     @State private var rootSource = Project.PanelRootSource.shell
+    @State private var syncQueue = PanelSyncQueue()
+    /// The remote heading. Held here rather than rebuilt, so its state and
+    /// its lamp survive every panel switch and poll.
+    @State private var remoteHeader = RemotePaneHeaderView(frame: .zero)
+    /// Mirrors the heading's own state, because the layout above has to give
+    /// back the row's height when the session is local.
+    @State private var remoteHeaderState = RemotePaneHeaderState.local
+    @State private var portForwards = PortForwardRegistry()
+    /// The selected session's forwards, or nil while it is local.
+    @State private var forwards: PortForwardController?
     @AppStorage("rightSidebarWidth") private var width: Double = 240
+
+    /// Changes whenever the selected session's connection appears, changes
+    /// state, or is replaced.
+    private var remoteConnectionToken: String {
+        guard let session = manager.selectedSession else { return "none" }
+        return workspaceEpoch(of: session)
+    }
+
+    private var sidebarFontScale: CGFloat {
+        CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
+    }
+
+    /// The heading is a published-state read costing nothing, and a connection
+    /// can die while the user is in another app — turning Wi-Fi off in Control
+    /// Centre is exactly that. So it keeps ticking whenever the pane is on
+    /// screen, active or not, while the panel refreshes below do not.
+    private var pollsRemoteHeading: Bool {
+        manager.isPanelVisible
+    }
 
     private var pollsSelectedPanel: Bool {
         manager.isPanelVisible
@@ -55,6 +163,18 @@ struct RightSidebarView: View {
 
                 VStack(spacing: 0) {
                     tabBar
+                    if remoteHeaderState != .local {
+                        RemotePaneHeaderHost(
+                            view: remoteHeader,
+                            fontScale: sidebarFontScale
+                        )
+                        .frame(height: remoteHeader.fittingSize.height)
+                        // Same inset as the panel headings below, so the
+                        // destination and the shell row share a left edge.
+                        // The view supplies its own top inset.
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
+                    }
                     switch manager.panelTab {
                     case .files:
                         FileTreePanel(
@@ -95,7 +215,11 @@ struct RightSidebarView: View {
                             }
                         )
                     case .info:
-                        InfoPanel(model: info, session: manager.selectedSession)
+                        InfoPanel(
+                            model: info,
+                            session: manager.selectedSession,
+                            forwards: forwards
+                        )
                     }
                 }
                 .frame(width: width)
@@ -113,6 +237,17 @@ struct RightSidebarView: View {
             }
         }
         .onAppear { syncModels() }
+        .task(id: pollsRemoteHeading) {
+            guard pollsRemoteHeading else { return }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+                applyRemoteHeading()
+            }
+        }
         // Files and process information remain live while visible. Git is
         // event-driven: terminal/Git command completion and app activation
         // refresh it without a repeating main-run-loop source.
@@ -148,12 +283,12 @@ struct RightSidebarView: View {
         // session.workingDirectory); resync at once so automatically rooted
         // panels follow the terminal without waiting for another event.
         .onChange(of: manager.selectedSession?.workingDirectory) { syncModels() }
+        // A connection appearing, connecting, dying or being replaced changes
+        // what the heading says; repaint it without waiting for the next tick.
+        .onChange(of: remoteConnectionToken) { applyRemoteHeading() }
         // Same for pinning/unpinning the project directory.
         .onChange(of: manager.selectedProject?.customDirectory) { syncModels() }
-        .environment(
-            \.sidebarFontScale,
-            CGFloat(settings.sidebarFontSize / AppSettings.defaultSidebarFontSize)
-        )
+        .environment(\.sidebarFontScale, sidebarFontScale)
         // Native button and control labels without a designed hierarchy use
         // the configured base size directly.
         .environment(\.font, .system(size: CGFloat(settings.sidebarFontSize)))
@@ -212,30 +347,86 @@ struct RightSidebarView: View {
     }
 
     private func syncModels() {
+        // Before the queue, not inside it: a refresh over a dead connection
+        // waits out its deadlines, and the heading must not wait with it.
+        applyRemoteHeading()
+        syncQueue.run { await performSync() }
+    }
+
+    /// The heading, and the forwards that belong to the current connection.
+    /// Cheap and synchronous — it reads published state and touches no
+    /// workspace, so it stays correct while the panels are stalled.
+    private func applyRemoteHeading() {
+        guard let session = manager.selectedProject?.selectedSession else { return }
+        // What the heading says is a fact about the terminal, not about any
+        // connection: an ssh Kero is not in front of has no connection at all
+        // and still has to be reported.
+        let headerState = session.remoteHeaderState
+        remoteHeader.apply(state: headerState)
+        remoteHeader.workingDirectory = headerState == .local
+            ? nil
+            : session.panelDirectoryPath
+        if remoteHeaderState != headerState { remoteHeaderState = headerState }
+        let controller = portForwards.controller(for: session.location.remoteConnection)
+        if forwards !== controller { forwards = controller }
+    }
+
+    /// Which workspace a refresh belongs to. A connection changing state, or
+    /// being replaced, makes results that were already in flight stale.
+    private func workspaceEpoch(of session: TerminalSession) -> String {
+        guard let connection = session.location.remoteConnection else { return "local" }
+        return "\(connection.id) \(connection.state)"
+    }
+
+    private func performSync() async {
         guard manager.isPanelVisible,
               let project = manager.selectedProject,
               let session = project.selectedSession
         else { return }
-        let cwd = session.currentDirectoryPath
+        // The panel path, not the session's own: once the session is on a
+        // remote machine these panels follow the remote shell's directory,
+        // while new local terminals and restore snapshots keep the local one.
+        // A dead connection answers nothing: every call below would wait out
+        // its own deadline, one after another, and stall the refresh loop for
+        // as long as the link stays down. The panels keep their last remote
+        // contents instead, which is what the heading is telling the user.
+        if let connection = session.location.remoteConnection,
+           connection.state == .disconnected {
+            return
+        }
+        let epoch = workspaceEpoch(of: session)
+
+        let cwd = session.panelDirectoryPath
+        let backend = session.workspaceBackend
         // Files and Git anchor to the project directory — pinned when the
         // user set one, else the repository the session is working in — so
         // they don't re-root as the terminal cds around a repo; Info
         // describes the shell itself, showing its live cwd next to that root.
         // An agent that moves to its own worktree changes only its own
         // process directory, so the foreground job's cwd is passed in too.
-        let (root, source) = project.panelRoot(
-            followingSessionAt: cwd, foregroundAt: session.foregroundDirectoryPath
+        let (root, source) = await project.panelRoot(
+            followingSessionAt: cwd,
+            foregroundAt: session.foregroundDirectoryPath,
+            backend: backend
         )
+        // The connection may have died while that was in flight; its answer
+        // describes a workspace that is no longer the one on screen.
+        guard epoch == workspaceEpoch(of: session) else { return }
         if rootSource != source { rootSource = source }
         switch manager.panelTab {
         case .files:
-            fileTree.sync(root: root)
+            await fileTree.sync(root: root, backend: backend)
         case .git:
             break
         case .info:
-            info.sync(
+            // The panel pid, not the session's own: while remote these rows
+            // describe the remote login shell and its children, so filtering
+            // them by this Mac's shell pid would find nothing.
+            await info.sync(
                 root: cwd, projectRoot: root, projectRootSource: source,
-                shellName: session.shellName, shellPid: session.shellPid
+                shellName: session.shellName, shellPid: session.panelShellPid,
+                isRemote: session.location.remoteConnection != nil,
+                backend: backend
             )
         }
     }
@@ -320,15 +511,21 @@ private struct FileTreePanel: View {
                         )
                         .accessibilityLabel(rootBadge.description)
                 }
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.rootPath)])
-                } label: {
-                    Image(systemName: "arrow.up.forward.app")
-                        .sidebarFont(size: 11)
-                        .foregroundStyle(.secondary)
+                // Finder can only reach the local disk; while remote this
+                // path names a directory on another machine.
+                if session?.location.remoteConnection == nil {
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: model.rootPath)]
+                        )
+                    } label: {
+                        Image(systemName: "arrow.up.forward.app")
+                            .sidebarFont(size: 11)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reveal in Finder")
                 }
-                .buttonStyle(.plain)
-                .help("Reveal in Finder")
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
@@ -377,6 +574,13 @@ private struct FileTreeRow: View {
         git.fileDecoration(for: item.path, isDirectory: item.isDirectory)
     }
 
+    /// Whether this row names a file on another machine. A connection that has
+    /// dropped still counts: the path is remote either way, and handing it to
+    /// Finder would open whatever sits at the same path locally.
+    private var isRemote: Bool {
+        session?.location.remoteConnection != nil
+    }
+
     var body: some View {
         if item.isDraft {
             // The transient new-file/folder input row: no hover/menu, no
@@ -406,11 +610,14 @@ private struct FileTreeRow: View {
                 openToSide(item.path)
             }
         }
-        Button("Open in Default App") {
-            NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
-        }
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+        // Finder and the default app can only reach the local disk.
+        if !isRemote {
+            Button("Open in Default App") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+            }
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: item.path)])
+            }
         }
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
@@ -422,20 +629,52 @@ private struct FileTreeRow: View {
             }
             Divider()
             Button("New File…") {
-                model.beginNewFile(in: item.path)
+                Task { await model.beginNewFile(in: item.path) }
             }
             Button("New Folder…") {
-                model.beginNewFolder(in: item.path)
+                Task { await model.beginNewFolder(in: item.path) }
             }
         }
         Divider()
         Button("Rename") {
             model.beginRename(item)
         }
-        Button("Move to Trash", role: .destructive) {
-            model.moveToTrash(item)
-            refreshGitStatus()
+        if isRemote {
+            // No Trash on the remote: Freedesktop semantics vary between
+            // distributions and a silently misplaced file is worse than an
+            // explicit delete the user confirmed.
+            Button("Delete…", role: .destructive) {
+                guard confirmRemoteDelete() else { return }
+                Task {
+                    await model.delete(item)
+                    refreshGitStatus()
+                }
+            }
+        } else {
+            Button("Move to Trash", role: .destructive) {
+                Task {
+                    await model.moveToTrash(item)
+                    refreshGitStatus()
+                }
+            }
         }
+    }
+
+    /// Names the full remote path, because there is nothing to undo it with.
+    private func confirmRemoteDelete() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(
+            localized: "Delete “\(item.name)” on \(session?.location.remoteConnection?.displayName ?? "the remote machine")?",
+            comment: "Remote delete confirmation. The placeholders are a file name and a remote machine as user@host."
+        )
+        alert.informativeText = String(
+            localized: "\(item.path) will be deleted. This cannot be undone — a remote file does not go to the Trash.",
+            comment: "Remote delete confirmation detail. The placeholder is a full path."
+        )
+        alert.addButton(withTitle: String(localized: "Delete"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Commits an inline rename and, when the file actually moved, tells the
@@ -444,9 +683,12 @@ private struct FileTreeRow: View {
     private func commitRename() {
         guard isRenaming else { return }
         let oldPath = item.path
-        if let newPath = model.rename(item, to: editingName) {
-            onRename(oldPath, newPath)
-            refreshGitStatus()
+        let newName = editingName
+        Task {
+            if let newPath = await model.rename(item, to: newName) {
+                onRename(oldPath, newPath)
+                refreshGitStatus()
+            }
         }
     }
 
@@ -454,10 +696,13 @@ private struct FileTreeRow: View {
     /// Guarded so the commit-on-blur after Enter/Escape is a no-op.
     private func commitDraft() {
         guard item.isDraft, model.draft != nil else { return }
-        if let created = model.commitDraft(name: editingName) {
-            openFile(created)
+        let name = editingName
+        Task {
+            if let created = await model.commitDraft(name: name) {
+                openFile(created)
+            }
+            refreshGitStatus()
         }
-        refreshGitStatus()
     }
 
     @ViewBuilder
@@ -472,7 +717,7 @@ private struct FileTreeRow: View {
     private var rowButton: some View {
         Button {
             if item.isDirectory {
-                model.toggle(item)
+                Task { await model.toggle(item) }
             } else {
                 openFile(item.path)
             }
@@ -543,7 +788,10 @@ private struct FileTreeRow: View {
                 ? String(localized: "Folder name")
                 : String(localized: "File name"))
                 .onSubmit { commitDraft() }
-                .onKeyPress(.escape) { model.cancelDraft(); return .handled }
+                .onKeyPress(.escape) {
+                    Task { await model.cancelDraft() }
+                    return .handled
+                }
                 .onChange(of: fieldFocused) {
                     // Blur commits a typed name, cancels an empty one (VS Code).
                     if !fieldFocused { commitDraft() }
@@ -757,7 +1005,7 @@ private struct GitPanel: View {
             .disabled(model.isBusy)
         }
         .confirmationDialog(
-            "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files go to the Trash.",
+            discardAllTitle,
             isPresented: Binding(
                 get: { confirmDiscardAll },
                 set: {
@@ -937,8 +1185,11 @@ private struct GitPanel: View {
             Button("Copy Changed Paths") { copyChangedPaths() }
                 .disabled(model.totalChangeCount == 0)
             Button("Copy Repository Path") { copyToPasteboard(model.repoRoot) }
-            Button("Reveal Repository in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.repoRoot)])
+            // Finder can only show a path on this Mac.
+            if remoteName == nil {
+                Button("Reveal Repository in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.repoRoot)])
+                }
             }
         } label: {
             ZStack {
@@ -1546,6 +1797,7 @@ private struct GitPanel: View {
             entry: entry,
             status: status,
             kind: kind,
+            isRemote: remoteName != nil,
             disabled: model.isBusy,
             isStageLoading: operationIsLoading(stageTrigger),
             isUnstageLoading: operationIsLoading(unstageTrigger),
@@ -1584,8 +1836,35 @@ private struct GitPanel: View {
         }
     }
 
+    /// The machine a discard would act on, or nil while local.
+    private var remoteName: String? {
+        session?.location.remoteConnection?.displayName
+    }
+
     private func discardTitle(for entry: GitStatusModel.Entry?) -> String {
         guard let entry else { return "" }
+        // There is no Trash on the remote: these files are deleted outright,
+        // so the confirmation says so and names the full path.
+        if let remoteName {
+            if entry.isUntracked {
+                return String(
+                    localized: "Delete \(entry.path) on \(remoteName)? A remote file is deleted outright, not moved to the Trash.",
+                    comment: "Remote discard confirmation. The placeholders are a repository-relative path and a remote machine as user@host."
+                )
+            }
+            if entry.isWorktreeRename, let original = entry.origPath {
+                return String(
+                    localized: "Undo this rename? \(entry.path) is deleted on \(remoteName) and \(original) is restored.",
+                    comment: "Remote rename discard confirmation. The placeholders are the new path, a remote machine as user@host, and the old path."
+                )
+            }
+            if entry.isWorktreeCopy {
+                return String(
+                    localized: "Discard this copy? \(entry.path) is deleted on \(remoteName), not moved to the Trash.",
+                    comment: "Remote copy discard confirmation. The placeholders are a path and a remote machine as user@host."
+                )
+            }
+        }
         if entry.isUntracked {
             return String(
                 localized: "Delete \(entry.fileName)? Its contents will move to the Trash.",
@@ -1613,10 +1892,25 @@ private struct GitPanel: View {
     private func discardActionTitle(for entry: GitStatusModel.Entry?) -> String {
         guard let entry else { return String(localized: "Discard Changes") }
         if entry.isUntracked || entry.isWorktreeCopy {
-            return String(localized: "Move to Trash")
+            return remoteName == nil
+                ? String(localized: "Move to Trash")
+                : String(localized: "Delete")
         }
         if entry.isWorktreeRename { return String(localized: "Undo Rename") }
         return String(localized: "Discard Changes")
+    }
+
+    private var discardAllTitle: String {
+        guard let remoteName else {
+            return String(
+                localized: "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files go to the Trash.",
+                comment: "Discard-all confirmation. The placeholder is a number of changes."
+            )
+        }
+        return String(
+            localized: "Discard the \(pendingDiscardAll.count) reviewed changes? Untracked and moved files are deleted outright on \(remoteName), not moved to the Trash.",
+            comment: "Remote discard-all confirmation. The placeholders are a number of changes and a remote machine as user@host."
+        )
     }
 
     private func makePendingDiscard(_ entry: GitStatusModel.Entry) -> PendingDiscard {
@@ -1979,6 +2273,9 @@ private struct GitEntryRow: View {
     let entry: GitStatusModel.Entry
     let status: Character
     let kind: Kind
+    /// Whether this repository is on another machine, where discarding an
+    /// untracked or copied file deletes it rather than moving it to the Trash.
+    let isRemote: Bool
     let disabled: Bool
     let isStageLoading: Bool
     let isUnstageLoading: Bool
@@ -2142,8 +2439,10 @@ private struct GitEntryRow: View {
                 .disabled(disabled)
         }
         Divider()
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: absolutePath)])
+        if !isRemote {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: absolutePath)])
+            }
         }
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
@@ -2170,7 +2469,9 @@ private struct GitEntryRow: View {
 
     private var destructiveMenuTitle: String {
         if entry.isUntracked || entry.isWorktreeCopy {
-            return String(localized: "Move to Trash…")
+            return isRemote
+                ? String(localized: "Delete…")
+                : String(localized: "Move to Trash…")
         }
         if entry.isWorktreeRename { return String(localized: "Undo Rename…") }
         return String(localized: "Discard Changes…")
@@ -2196,6 +2497,9 @@ private struct InfoPanel: View {
     @ObservedObject var model: SessionInfoModel
     @ObservedObject private var themeChanges = Theme.changes
     let session: TerminalSession?
+    /// The remote session's open forwards. Nil while local, where a listening
+    /// port is already reachable on this Mac.
+    var forwards: PortForwardController?
 
     @State private var currentDirectoryCollapsed = false
     @State private var projectDirectoryCollapsed = false
@@ -2204,6 +2508,12 @@ private struct InfoPanel: View {
 
     private static let vsCodeURL = NSWorkspace.shared
         .urlForApplication(withBundleIdentifier: "com.microsoft.VSCode")
+
+    /// Whether these directories live on another machine. Finder and VS Code
+    /// would otherwise open whatever sits at the same path locally.
+    private var isRemote: Bool {
+        session?.location.remoteConnection != nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2233,7 +2543,7 @@ private struct InfoPanel: View {
                 subtitle: model.shellPid > 0 ? "pid \(String(model.shellPid))" : nil
             )
             Button {
-                model.refresh()
+                Task { await model.refresh() }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .sidebarFont(size: 10, weight: .medium)
@@ -2313,12 +2623,14 @@ private struct InfoPanel: View {
                 }
 
             HStack(spacing: 4) {
-                actionButton("Finder", systemImage: "arrow.up.forward.app") {
-                    NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: path)]
-                    )
+                if !isRemote {
+                    actionButton("Finder", systemImage: "arrow.up.forward.app") {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: path)]
+                        )
+                    }
                 }
-                if let vsCode = Self.vsCodeURL {
+                if !isRemote, let vsCode = Self.vsCodeURL {
                     actionButton("VS Code", systemImage: "chevron.left.forwardslash.chevron.right") {
                         NSWorkspace.shared.open(
                             [URL(fileURLWithPath: path)],
@@ -2335,6 +2647,53 @@ private struct InfoPanel: View {
         .padding(.horizontal, 6)
         .padding(.top, 2)
         .padding(.bottom, 4)
+    }
+
+    /// Locally a listening port is already reachable here. On a remote it is
+    /// not, so "open" means forward it to a loopback port first and open that.
+    /// Never automatic: this only runs because someone clicked the row.
+    private func openPort(_ port: SessionInfoModel.PortItem) {
+        guard isRemote else {
+            if let url = port.url { NSWorkspace.shared.open(url) }
+            return
+        }
+        withForwardedURL(port) { NSWorkspace.shared.open($0) }
+    }
+
+    private func copyPortURL(_ port: SessionInfoModel.PortItem) {
+        guard isRemote else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("http://localhost:\(port.port)", forType: .string)
+            return
+        }
+        withForwardedURL(port) { url in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        }
+    }
+
+    /// Forwards `port` if it is not already, then hands over the loopback URL
+    /// it is reachable on. Asking twice reuses the same forward.
+    private func withForwardedURL(
+        _ port: SessionInfoModel.PortItem, then use: @escaping (URL) -> Void
+    ) {
+        guard let forwards else { return }
+        Task {
+            do {
+                let localPort = try await forwards.forward(remotePort: port.port)
+                guard let url = URL(string: "http://127.0.0.1:\(localPort)/") else { return }
+                use(url)
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = String(
+                    localized: "Couldn’t forward port \(port.port).",
+                    comment: "Remote port forward failure. The placeholder is a port number."
+                )
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
     }
 
     private func copyPath(_ path: String) {
@@ -2383,7 +2742,7 @@ private struct InfoPanel: View {
             } else {
                 ForEach(model.processes) { process in
                     InfoProcessRow(process: process) { force in
-                        model.kill(process.pid, force: force)
+                        Task { await model.kill(process.pid, force: force) }
                     }
                 }
             }
@@ -2405,9 +2764,16 @@ private struct InfoPanel: View {
                 emptyRow(String(localized: "No listening ports"))
             } else {
                 ForEach(model.ports) { port in
-                    InfoPortRow(port: port) { force in
-                        model.kill(port.pid, force: force)
-                    }
+                    InfoPortRow(
+                        port: port,
+                        localPort: forwards?.localPort(forRemote: port.port),
+                        isRemote: isRemote,
+                        open: { openPort(port) },
+                        copyURL: { copyPortURL(port) },
+                        kill: { force in
+                            Task { await model.kill(port.pid, force: force) }
+                        }
+                    )
                 }
             }
         }
@@ -2490,24 +2856,40 @@ private struct InfoProcessRow: View {
 
 private struct InfoPortRow: View {
     let port: SessionInfoModel.PortItem
+    /// The loopback port this remote port is forwarded to, once it is.
+    let localPort: Int?
+    let isRemote: Bool
+    let open: () -> Void
+    let copyURL: () -> Void
     let kill: (_ force: Bool) -> Void
 
     @State private var isHovering = false
 
-    private var urlString: String { "http://localhost:\(port.port)" }
+    /// What clicking the row reaches. A remote port that is not forwarded yet
+    /// has no address to show until it is, so the label says so instead of
+    /// naming one that would not answer.
+    private var urlString: String {
+        if let localPort { return "http://127.0.0.1:\(localPort)" }
+        return isRemote
+            ? String(localized: "Forward this port and open it")
+            : "http://localhost:\(port.port)"
+    }
+
+    /// The port cell: the remote number alone, or both numbers once forwarded,
+    /// so it is clear which machine each belongs to.
+    private var portLabel: String {
+        guard let localPort else { return String(port.port) }
+        return "\(port.port) → \(localPort)"
+    }
 
     var body: some View {
-        Button {
-            if let url = port.url {
-                NSWorkspace.shared.open(url)
-            }
-        } label: {
+        Button(action: open) {
             HStack(spacing: 7) {
-                Image(systemName: "network")
+                Image(systemName: isRemote ? "arrow.left.arrow.right" : "network")
                     .sidebarFont(size: 9, weight: .medium)
                     .foregroundStyle(Color(red: 0.35, green: 0.65, blue: 1.0))
                     .frame(width: 12)
-                Text(String(port.port))
+                Text(portLabel)
                     .sidebarFont(size: 11.5, weight: .medium, design: .monospaced)
                     .foregroundStyle(.secondary)
                     .layoutPriority(1)
@@ -2529,25 +2911,34 @@ private struct InfoPortRow: View {
             .contentShape(RoundedRectangle(cornerRadius: 4))
         }
         .buttonStyle(.plain)
-        .help("Open \(urlString)")
+        .help(helpText)
         .background(
             RoundedRectangle(cornerRadius: 4)
                 .fill(isHovering ? Color.primary.opacity(0.05) : .clear)
         )
         .onHover { isHovering = $0 }
         .contextMenu {
-            Button("Open in Browser") {
-                if let url = port.url {
-                    NSWorkspace.shared.open(url)
-                }
+            Button(isRemote && localPort == nil ? "Forward and Open" : "Open in Browser") {
+                open()
             }
-            Button("Copy URL") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(urlString, forType: .string)
-            }
+            Button("Copy URL") { copyURL() }
             Divider()
             Button("Kill Process (\(port.processName))") { kill(false) }
         }
+    }
+
+    private var helpText: String {
+        guard isRemote else { return String(localized: "Open \(urlString)") }
+        guard let localPort else {
+            return String(
+                localized: "Forward remote port \(port.port) to this Mac and open it",
+                comment: "Port row tooltip on a remote session. The placeholder is a port number."
+            )
+        }
+        return String(
+            localized: "Remote port \(port.port), open at http://127.0.0.1:\(localPort)/",
+            comment: "Port row tooltip once forwarded. The placeholders are the remote and local port numbers."
+        )
     }
 }
 

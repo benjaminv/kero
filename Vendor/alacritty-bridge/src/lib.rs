@@ -541,12 +541,57 @@ impl StreamScanner {
 fn working_directory_from_osc7(value: &str) -> Option<String> {
     let path = if let Some(rest) = value.strip_prefix("file://") {
         let slash = rest.find('/')?;
+        if !osc7_host_is_local(&rest[..slash], local_hostname().as_deref()) {
+            return None;
+        }
         &rest[slash..]
     } else {
         value
     };
     let decoded = percent_decode(path);
     clean_terminal_text(&decoded, 4096)
+}
+
+/// OSC 7 names the machine that owns the path. A shell on another machine (an
+/// ssh session whose prompt emits OSC 7) reports paths that do not exist here,
+/// so anything but this host is rejected. Ghostty's core applies the same rule.
+fn osc7_host_is_local(host: &str, local: Option<&str>) -> bool {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    local.is_some_and(|local| {
+        strip_dot_local(host).eq_ignore_ascii_case(strip_dot_local(local))
+    })
+}
+
+fn strip_dot_local(name: &str) -> &str {
+    // Byte indexing: a host is normally ASCII, but a malformed OSC 7 may carry
+    // anything, and slicing inside a character would abort the process.
+    let split = name.len().saturating_sub(".local".len());
+    match (name.get(split..), name.get(..split)) {
+        (Some(suffix), Some(head)) if split > 0 && suffix.eq_ignore_ascii_case(".local") => head,
+        _ => name,
+    }
+}
+
+/// Read fresh every time rather than cached: macOS takes the hostname from the
+/// network when none is configured, so it changes as the machine moves between
+/// networks, and a stale value would reject the local shell's own directories.
+fn local_hostname() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut c_char, len: usize) -> i32;
+    }
+    let mut buffer = [0u8; 256];
+    // SAFETY: gethostname writes at most `len` bytes into the buffer. Truncation
+    // may leave it without a NUL, hence the explicit length scan.
+    if unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&byte| byte == 0)?;
+    std::str::from_utf8(&buffer[..end])
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_progress(value: &str) -> Option<OscEvent> {
@@ -2276,11 +2321,51 @@ mod tests {
     }
 
     #[test]
+    fn osc7_accepts_only_local_hosts() {
+        assert_eq!(
+            working_directory_from_osc7("file:///Users/egoist"),
+            Some("/Users/egoist".to_owned())
+        );
+        assert_eq!(
+            working_directory_from_osc7("file://localhost/Users/egoist"),
+            Some("/Users/egoist".to_owned())
+        );
+        assert_eq!(working_directory_from_osc7("file://host/home/egoist"), None);
+        assert_eq!(
+            working_directory_from_osc7("file://host.example.com/home/egoist"),
+            None
+        );
+        // A host that is not ASCII must be rejected, never sliced mid-character.
+        assert_eq!(working_directory_from_osc7("file://\u{e9}abcde/home/egoist"), None);
+
+        let local = local_hostname().expect("this machine reports a hostname");
+        let local = local.as_str();
+        assert_eq!(
+            working_directory_from_osc7(&format!("file://{local}/Users/egoist")),
+            Some("/Users/egoist".to_owned())
+        );
+        let bare = strip_dot_local(local);
+        assert_eq!(
+            working_directory_from_osc7(&format!("file://{bare}/Users/egoist")),
+            Some("/Users/egoist".to_owned())
+        );
+        assert_eq!(
+            working_directory_from_osc7(&format!("file://{bare}.local/Users/egoist")),
+            Some("/Users/egoist".to_owned())
+        );
+        assert_eq!(
+            working_directory_from_osc7(&format!("file://{}/Users/egoist", local.to_uppercase())),
+            Some("/Users/egoist".to_owned())
+        );
+    }
+
+    #[test]
     fn osc_interceptor_extracts_host_integrations() {
         let mut interceptor = OscInterceptor::default();
         let input = concat!(
             "before",
-            "\x1b]7;file://host/Users/egoist/My%20Project\x07",
+            "\x1b]7;file:///Users/egoist/My%20Project\x07",
+            "\x1b]7;file://host/Users/egoist/Elsewhere\x07",
             "\x1b]9;4;1;150\x1b\\",
             "\x1b]9;Build complete\x07",
             "\x1b]777;notify;Grok;Turn complete\x1b\\",

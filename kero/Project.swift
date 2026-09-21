@@ -38,6 +38,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// because every way of reaching a tab — strip click, Ctrl-number,
     /// opening a file — counts as a use.
     private var recentTabIDs: [UUID] = []
+    private var isRemoteTabRebindPending = false
 
     private let fallbackName: String
     /// Sessions publish their own changes (title, directory); re-publish them
@@ -182,47 +183,44 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         if let pinned = customDirectory, FileManager.default.fileExists(atPath: pinned) {
             return (pinned, .pinned)
         }
-        let shellRoot = Self.closestGitRepository(containing: cwd) ?? cwd
+        let shellRoot = LocalWorkspaceBackend.gitRootSync(containing: cwd) ?? cwd
         // Only a *different repository* re-roots the panels. A foreground job
         // running in a subdirectory of the shell's own checkout resolves to
         // the same root and is ignored, which keeps the file tree from
         // collapsing its expanded rows every time a command runs.
         if let foregroundCwd,
-           let foregroundRoot = Self.closestGitRepository(containing: foregroundCwd),
+           let foregroundRoot = LocalWorkspaceBackend.gitRootSync(containing: foregroundCwd),
            foregroundRoot != shellRoot {
-            return (foregroundRoot, .foreground(isWorktree: Self.isLinkedWorktree(foregroundRoot)))
+            return (
+                foregroundRoot,
+                .foreground(isWorktree: LocalWorkspaceBackend.isLinkedWorktreeSync(foregroundRoot))
+            )
         }
         return (shellRoot, .shell)
     }
 
-    /// Whether `root` is a linked worktree rather than a normal checkout: its
-    /// `.git` is a file pointing into the main repository's `worktrees`
-    /// directory (a submodule's points into `modules` instead).
-    private static func isLinkedWorktree(_ root: String) -> Bool {
-        let gitPath = (root as NSString).appendingPathComponent(".git")
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: gitPath, isDirectory: &isDirectory),
-              !isDirectory.boolValue,
-              let contents = try? String(contentsOfFile: gitPath, encoding: .utf8)
-        else { return false }
-        return contents.contains("/worktrees/")
-    }
-
-    /// The directory of the nearest enclosing git repository: walks up from
-    /// `path` looking for a `.git` entry — a directory in normal checkouts,
-    /// a file in worktrees and submodules.
-    private static func closestGitRepository(containing path: String) -> String? {
-        var dir = (path as NSString).standardizingPath
-        guard dir.hasPrefix("/") else { return nil }
-        let fm = FileManager.default
-        while true {
-            if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(".git")) {
-                return dir
-            }
-            let parent = (dir as NSString).deletingLastPathComponent
-            if parent == dir { return nil }
-            dir = parent
+    /// The same root over a workspace that may be a remote machine. Keep the
+    /// two in step: the synchronous form above stays only for callers that
+    /// cannot await (the command palette and the Git panel), and both reach
+    /// the same walk — one through `LocalWorkspaceBackend`'s helpers, one
+    /// through the backend that wraps them.
+    func panelRoot(
+        followingSessionAt cwd: String,
+        foregroundAt foregroundCwd: String? = nil,
+        backend: WorkspaceBackend
+    ) async -> (root: String, source: PanelRootSource) {
+        if let pinned = customDirectory,
+           ((try? await backend.stat(path: pinned)) ?? nil) != nil {
+            return (pinned, .pinned)
         }
+        let shellRoot = ((try? await backend.gitRoot(containing: cwd)) ?? nil) ?? cwd
+        if let foregroundCwd,
+           let foregroundRoot = (try? await backend.gitRoot(containing: foregroundCwd)) ?? nil,
+           foregroundRoot != shellRoot {
+            let isWorktree = (try? await backend.isLinkedWorktree(foregroundRoot)) ?? false
+            return (foregroundRoot, .foreground(isWorktree: isWorktree))
+        }
+        return (shellRoot, .shell)
     }
 
     // MARK: - Sessions
@@ -271,8 +269,54 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         }
         sessionObservations[session.id] = session.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+            // A session's connection coming or going decides whether the
+            // project's remote tabs can be read and written.
+            self?.scheduleRemoteTabRebind()
         }
         return session
+    }
+
+    // MARK: - Remote tabs
+
+    /// A live workspace for `identity`, from whichever session in this project
+    /// holds it. A file belongs to a machine, not to the terminal it happened
+    /// to be opened from: reconnecting in a second terminal of the same
+    /// project makes those tabs writable again.
+    func connectedWorkspace(for identity: String) -> WorkspaceBackend? {
+        for session in sessions {
+            guard let connection = session.location.remoteConnection,
+                  connection.workspaceIdentity == identity,
+                  connection.state == .connected
+            else { continue }
+            let backend = session.workspaceBackend
+            // The session reports a remote workspace only once the connection
+            // is connected and its directory is known; until then it is still
+            // answering with the local disk, which is not this file's machine.
+            if !(backend is LocalWorkspaceBackend) { return backend }
+        }
+        return nil
+    }
+
+    /// Re-checks every remote file and diff against the project's connections.
+    /// Observations arrive before the change lands, so this runs one hop later
+    /// and at most once per turn.
+    private func scheduleRemoteTabRebind() {
+        guard !isRemoteTabRebindPending else { return }
+        isRemoteTabRebindPending = true
+        Task { @MainActor in
+            isRemoteTabRebindPending = false
+            rebindRemoteTabs()
+        }
+    }
+
+    func rebindRemoteTabs() {
+        for content in tabs.flatMap(\.allContents) {
+            switch content {
+            case .file(let file): file.reevaluateWorkspace(in: self)
+            case .diff(let diff): diff.reevaluateWorkspace(in: self)
+            case .session, .browser: break
+            }
+        }
     }
 
     func terminateAll() {
@@ -353,15 +397,19 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     /// Opens `path` as a new file tab, reusing an existing tab/pane for the
     /// same path. `editorState` seeds scroll/cursor state when restoring.
     func openFile(_ path: String, editorState: EditorState? = nil) {
-        if let (tab, paneID) = findFilePane(path: path) {
+        // Capture the current directory context *before* selection moves to the
+        // new tab, so its panels track the tab the file was opened from. The
+        // same session decides which workspace the path belongs to, so the
+        // lookup below cannot reuse a tab from another machine.
+        let context = selectedSession
+        if let (tab, paneID) = findFilePane(
+            path: path, workspace: context?.workspaceIdentity
+        ) {
             selectedTabID = tab.id
             tab.focusedPaneID = paneID
             return
         }
-        // Capture the current directory context *before* selection moves to the
-        // new tab, so its panels track the tab the file was opened from.
-        let context = selectedSession
-        let file = FileTab(path: path)
+        let file = FileTab(path: path, session: context)
         if let editorState {
             file.editorState = editorState
         }
@@ -379,20 +427,35 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             openFile(path)
             return
         }
+        let session = selectedSession
         if let existing = tab.allPanes.first(where: {
-            if case .file(let file) = $0.content { return file.path == path }
+            if case .file(let file) = $0.content {
+                return file.path == path
+                    && file.workspaceIdentity == session?.workspaceIdentity
+            }
             return false
         }) {
             tab.focusedPaneID = existing.id
             return
         }
-        tab.split(Pane(content: .file(FileTab(path: path))), toward: .right)
+        tab.split(
+            Pane(content: .file(FileTab(path: path, session: session))),
+            toward: .right
+        )
     }
 
-    private func findFilePane(path: String) -> (tab: PaneTab, paneID: UUID)? {
+    /// A tab is the same tab only when it holds the same path *on the same
+    /// machine*: `/etc/hosts` here and `/etc/hosts` on a remote are two files,
+    /// and reusing one tab for both would show one machine's contents while
+    /// saving to the other.
+    private func findFilePane(
+        path: String, workspace: String?
+    ) -> (tab: PaneTab, paneID: UUID)? {
         for tab in tabs {
             if let pane = tab.allPanes.first(where: {
-                if case .file(let file) = $0.content { return file.path == path }
+                if case .file(let file) = $0.content {
+                    return file.path == path && file.workspaceIdentity == workspace
+                }
                 return false
             }) {
                 return (tab, pane.id)
@@ -475,8 +538,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     func openDiff(
         repoRoot: String, path: String, staged: Bool, untracked: Bool, origPath: String?
     ) {
+        let context = selectedSession
         if let (tab, pane) = findDiffPane(
-            repoRoot: repoRoot, path: path, staged: staged, commitHash: nil
+            repoRoot: repoRoot, path: path, staged: staged, commitHash: nil,
+            workspace: context?.workspaceIdentity
         ),
            case .diff(let diff) = pane.content {
             diff.untracked = untracked
@@ -486,10 +551,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             tab.focusedPaneID = pane.id
             return
         }
-        let context = selectedSession
         let diff = DiffTab(
             repoRoot: repoRoot, path: path, staged: staged,
-            untracked: untracked, origPath: origPath
+            untracked: untracked, origPath: origPath,
+            session: context
         )
         let tab = makeTab(content: .diff(diff))
         tab.contextSession = context
@@ -507,8 +572,10 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         status: Character,
         origPath: String?
     ) {
+        let context = selectedSession
         if let (tab, pane) = findDiffPane(
-            repoRoot: repoRoot, path: path, staged: false, commitHash: commitHash
+            repoRoot: repoRoot, path: path, staged: false, commitHash: commitHash,
+            workspace: context?.workspaceIdentity
         ), case .diff(let diff) = pane.content {
             diff.origPath = origPath
             diff.reload()
@@ -516,7 +583,6 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             tab.focusedPaneID = pane.id
             return
         }
-        let context = selectedSession
         let diff = DiffTab(
             repoRoot: repoRoot,
             path: path,
@@ -525,7 +591,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
             origPath: origPath,
             commitHash: commitHash,
             commitParentHash: parentHash,
-            commitStatus: status
+            commitStatus: status,
+            session: context
         )
         let tab = makeTab(content: .diff(diff))
         tab.contextSession = context
@@ -534,7 +601,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
     }
 
     private func findDiffPane(
-        repoRoot: String, path: String, staged: Bool, commitHash: String?
+        repoRoot: String, path: String, staged: Bool, commitHash: String?,
+        workspace: String?
     ) -> (tab: PaneTab, pane: Pane)? {
         for tab in tabs {
             if let pane = tab.allPanes.first(where: {
@@ -543,6 +611,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
                         && diff.path == path
                         && diff.staged == staged
                         && diff.commitHash == commitHash
+                        && diff.workspaceIdentity == workspace
                 }
                 return false
             }) {
@@ -661,7 +730,7 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
 
         switch response {
         case .alertFirstButtonReturn: // Save
-            content.save()
+            await content.save()
             // Keep the pane open if the write failed; the error bar shows why.
             guard content.saveError == nil else { return true }
             removePaneWithContent(content.id)
@@ -836,6 +905,8 @@ final class Project: nonisolated ObservableObject, nonisolated Identifiable {
         case .session(let workingDirectory):
             return .session(makeSession(directory: workingDirectory, restoredHistory: restoredHistory))
         case .file(let path, let editorState):
+            // Restored tabs are always local: a remote connection does not
+            // survive a relaunch.
             let file = FileTab(path: path)
             if let editorState { file.editorState = editorState }
             return .file(file)
