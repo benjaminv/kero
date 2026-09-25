@@ -62,28 +62,38 @@ nonisolated enum RemoteCommands {
         return port == 0 ? nil : port
     }
 
-    /// Whether this exact loopback port can be taken right now, on both
-    /// `127.0.0.1` and `::1`.
+    /// Whether nothing on this Mac is listening on `port` where `localhost`
+    /// could reach it, so a forward on that number would be the only thing
+    /// answering there.
     ///
-    /// Deliberately without `SO_REUSEADDR`. ssh sets it on its own listeners,
-    /// and on macOS that lets a bind to `127.0.0.1:N` succeed beside a local
-    /// server already listening on `*:N`, which would leave two listeners and
-    /// the browser reaching whichever the kernel picks. Probing without it
-    /// turns that case into `EADDRINUSE`.
+    /// Probes four binds, each with `SO_REUSEADDR`: `127.0.0.1`, `0.0.0.0`,
+    /// `::1` and `::`. The option is what ssh sets on its own listener, and it
+    /// makes the probe ignore connections lingering in TIME_WAIT (30 s on
+    /// macOS), which follow every forward whose side closed first. Without it
+    /// a forward that was just dropped, after a wake or a reconnect, would
+    /// read as busy and move to a different port. The cost is that on macOS a
+    /// reusable bind to `127.0.0.1:N` succeeds beside a server on `*:N`, so
+    /// the wildcard addresses are probed too: binding the exact address a live
+    /// listener holds fails even with the option.
     ///
     /// Both families matter because `localhost` can resolve to `::1` first on
     /// macOS: a local process on `[::1]:N` would win over an IPv4 forward.
-    /// A Mac with no IPv6 loopback just skips that half.
+    /// A Mac with no IPv6 just skips those two.
     static func isLocalPortFree(_ port: UInt16) -> Bool {
         guard port != 0 else { return false }
-        return canBindLoopback(family: AF_INET, port: port)
-            && canBindLoopback(family: AF_INET6, port: port)
+        return canBind(family: AF_INET, loopback: true, port: port)
+            && canBind(family: AF_INET, loopback: false, port: port)
+            && canBind(family: AF_INET6, loopback: true, port: port)
+            && canBind(family: AF_INET6, loopback: false, port: port)
     }
 
-    private static func canBindLoopback(family: Int32, port: UInt16) -> Bool {
+    private static func canBind(family: Int32, loopback: Bool, port: UInt16) -> Bool {
         let descriptor = socket(family, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return family == AF_INET6 && errno == EAFNOSUPPORT }
         defer { close(descriptor) }
+        var reuse: Int32 = 1
+        setsockopt(
+            descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
 
         let bound: Int32
         if family == AF_INET6 {
@@ -91,7 +101,7 @@ nonisolated enum RemoteCommands {
             address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
             address.sin6_family = sa_family_t(AF_INET6)
             address.sin6_port = port.bigEndian
-            address.sin6_addr = in6addr_loopback
+            address.sin6_addr = loopback ? in6addr_loopback : in6addr_any
             bound = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
@@ -102,7 +112,7 @@ nonisolated enum RemoteCommands {
             address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET)
             address.sin_port = port.bigEndian
-            address.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+            address.sin_addr.s_addr = (loopback ? INADDR_LOOPBACK : INADDR_ANY).bigEndian
             bound = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
