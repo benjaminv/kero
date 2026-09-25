@@ -468,11 +468,13 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
         problemLabel.isHidden = true
         problemLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let cancel = NSButton(title: String(localized: "Cancel"), target: self, action: #selector(cancel))
-        cancel.keyEquivalent = "\u{1b}"
-        let save = NSButton(title: String(localized: "Save"), target: self, action: #selector(save))
-        save.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [cancel, save])
+        let cancelButton = NSButton(
+            title: String(localized: "Cancel"), target: self, action: #selector(cancelClicked))
+        cancelButton.keyEquivalent = "\u{1b}"
+        let saveButton = NSButton(
+            title: String(localized: "Save"), target: self, action: #selector(saveClicked))
+        saveButton.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [cancelButton, saveButton])
         buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
@@ -509,11 +511,11 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
         }
     }
 
-    @objc private func cancel() {
+    @objc private func cancelClicked() {
         sheet.sheetParent?.endSheet(sheet, returnCode: .cancel)
     }
 
-    @objc private func save() {
+    @objc private func saveClicked() {
         func trimmed(_ field: NSTextField) -> String {
             field.stringValue.trimmingCharacters(in: .whitespaces)
         }
