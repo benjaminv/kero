@@ -98,9 +98,10 @@ final class TunnelManager: ObservableObject {
         runners[id]?.restartNow()
     }
 
-    /// Another enabled forward already claiming `localPort`, if any.
-    func conflict(localPort: Int, excluding id: UUID) -> TunnelDefinition? {
-        tunnels.first { $0.isEnabled && $0.id != id && $0.localPort == localPort }
+    /// Another enabled forward that would listen on the same port on the same
+    /// machine as `tunnel`, if any.
+    func conflict(with tunnel: TunnelDefinition) -> TunnelDefinition? {
+        tunnels.first { $0.isEnabled && $0.id != tunnel.id && $0.listensAlongside(tunnel) }
     }
 
     func state(for id: UUID) -> TunnelState {
@@ -160,7 +161,9 @@ final class TunnelManager: ObservableObject {
 
 /// Owns the ssh process for one enabled forward and keeps it running:
 /// launch, detect that the listener is up, and relaunch with backoff when it
-/// exits.
+/// exits. The listener is on this Mac for a local forward and on the remote
+/// machine for a remote one, which changes how "up" is detected but nothing
+/// else.
 @MainActor
 private final class TunnelRunner {
     let definition: TunnelDefinition
@@ -220,6 +223,13 @@ private final class TunnelRunner {
             report(.failed(message: problem, retryAt: nil))
             return
         }
+        // A remote forward's listener is on the other machine, where only its
+        // sshd can tell whether the port is free; ExitOnForwardFailure turns
+        // its refusal into an exit and the usual retry.
+        guard definition.direction == .local else {
+            spawn()
+            return
+        }
         // ssh would bind 127.0.0.1 with SO_REUSEADDR and could succeed beside
         // a local server on *:port; refuse instead so the browser never
         // reaches the wrong one. See RemoteCommands.isLocalPortFree.
@@ -254,7 +264,7 @@ private final class TunnelRunner {
     private func spawn() {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = [
+        var arguments = [
             "-N", "-T",
             "-o", "BatchMode=yes",
             "-o", "ExitOnForwardFailure=yes",
@@ -265,10 +275,19 @@ private final class TunnelRunner {
             // sessions when their config sets `ControlMaster auto`.
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
-            "-o", "LogLevel=ERROR",
-            "-L", definition.forwardSpecification,
-            "--", definition.host,
         ]
+        switch definition.direction {
+        case .local:
+            arguments += ["-o", "LogLevel=ERROR", "-L", definition.forwardSpecification]
+        case .remote:
+            // DEBUG1 is the only level at which ssh says the remote listener
+            // was accepted ("remote forward success for: …"), and nothing on
+            // this Mac can be probed for it. See watchForListener. A refusal
+            // is printed at ERROR level regardless.
+            arguments += ["-o", "LogLevel=DEBUG1", "-R", definition.forwardSpecification]
+        }
+        arguments += ["--", definition.host]
+        process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         // The error text shown in Settings must not follow the user's locale.
         environment["LC_ALL"] = "C"
@@ -311,18 +330,26 @@ private final class TunnelRunner {
         watchForListener(process)
     }
 
-    /// `ssh -N` prints nothing once the forward is ready. With
-    /// `ExitOnForwardFailure` it exits if the listener can't be set up, so a
-    /// process that is still running while the local port has become busy
-    /// is a working forward.
+    /// `ssh -N` prints nothing at its normal log level once the forward is
+    /// ready. With `ExitOnForwardFailure` it exits if the listener can't be
+    /// set up, so for a local forward a process that is still running while
+    /// the local port has become busy is a working forward. A remote
+    /// listener can't be probed from here, so that direction runs ssh at
+    /// DEBUG1 and waits for its "remote forward success" line instead.
     private func watchForListener(_ process: Process) {
         readinessTask?.cancel()
+        let buffer = errorOutput
         readinessTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, !Task.isCancelled, self.process === process, process.isRunning
                 else { return }
-                if !RemoteCommands.isLocalPortFree(UInt16(self.definition.localPort)) {
+                let isUp =
+                    switch self.definition.direction {
+                    case .local: !RemoteCommands.isLocalPortFree(UInt16(self.definition.localPort))
+                    case .remote: buffer.sawRemoteForwardSuccess
+                    }
+                if isUp {
                     self.upSince = Date()
                     self.report(.up)
                     return
@@ -379,6 +406,10 @@ private final class TunnelRunner {
 /// ssh's stderr, written from the pipe's reader thread and read on the main
 /// actor once the process exits. Only the tail matters: the last line is
 /// usually the reason, such as "Permission denied (publickey)".
+///
+/// For a remote forward ssh runs at DEBUG1, so the buffer also watches for
+/// the one debug line that means the remote listener is up, and the debug
+/// chatter is skipped when looking for a reason.
 private nonisolated final class TunnelStderrBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var data = Data()
@@ -389,6 +420,10 @@ private nonisolated final class TunnelStderrBuffer: @unchecked Sendable {
         "channel_setup_fwd_listener",
         "Could not request local forwarding",
     ]
+    /// What ssh logs, at DEBUG1, once the remote sshd has accepted a `-R`
+    /// listener: "remote forward success for: listen 127.0.0.1:2222, …".
+    private static let remoteForwardSuccess = Data("remote forward success for:".utf8)
+    private var _sawRemoteForwardSuccess = false
 
     init() {}
 
@@ -396,7 +431,18 @@ private nonisolated final class TunnelStderrBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         data.append(chunk)
+        // Checked on the whole tail rather than the chunk, so a line split
+        // across two reads is still seen.
+        if !_sawRemoteForwardSuccess, data.range(of: Self.remoteForwardSuccess) != nil {
+            _sawRemoteForwardSuccess = true
+        }
         if data.count > Self.limit { data = data.suffix(Self.limit) }
+    }
+
+    var sawRemoteForwardSuccess: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _sawRemoteForwardSuccess
     }
 
     var lastLine: String? {
@@ -406,7 +452,8 @@ private nonisolated final class TunnelStderrBuffer: @unchecked Sendable {
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .last { line in
-                !line.isEmpty && !Self.followUpPrefixes.contains { line.hasPrefix($0) }
+                !line.isEmpty && !line.hasPrefix("debug")
+                    && !Self.followUpPrefixes.contains { line.hasPrefix($0) }
             }
     }
 }
