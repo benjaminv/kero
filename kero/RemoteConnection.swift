@@ -181,17 +181,42 @@ final class RemoteConnection: ObservableObject, Identifiable, RemoteCommandRunne
         return result.status == 0
     }
 
-    /// Allocates a local listener on 127.0.0.1 forwarding to `remotePort` on
-    /// the remote's own loopback, and returns the local port. Never binds
-    /// 0.0.0.0. The forward dies with the connection because the helper sets
+    /// Opens a local listener on 127.0.0.1 forwarding to `remotePort` on the
+    /// remote's own loopback, and returns the local port. Never binds 0.0.0.0.
+    /// The forward dies with the connection because the helper sets
     /// `ControlPersist=no`.
+    ///
+    /// The local port is the remote number itself whenever this Mac has it
+    /// free. Dev servers such as Vite write their own port into the pages they
+    /// serve (`http://localhost:5173/@vite/client`), so a forward on any other
+    /// number loads the page but none of its scripts or live reload. Only when
+    /// that number is taken, or below 1024 where binding needs root, does Kero
+    /// fall back to a free port of its choosing.
     ///
     /// OpenSSH 10.2 rejects port 0 in a local forward specification ("Bad
     /// local forwarding specification"), so Kero picks the free port itself
     /// and names it explicitly. A successful `-O forward` prints nothing.
     func forward(remotePort: Int) async throws -> Int {
         guard state == .connected else { throw RemoteConnectionError.notConnected }
-        let localPort = try Self.freeLocalPort()
+        if (1024...65535).contains(remotePort),
+            RemoteCommands.isLocalPortFree(UInt16(remotePort))
+        {
+            do {
+                return try await requestForward(localPort: remotePort, remotePort: remotePort)
+            } catch RemoteConnectionError.commandFailed(_, let message) {
+                // Something took the port between the probe and ssh's bind.
+                // A random port still works for most servers, so try that
+                // rather than showing an error.
+                NSLog(
+                    "kero: remote connection %@ could not forward to local port %d (%@), using a free port",
+                    destination, remotePort, message
+                )
+            }
+        }
+        return try await requestForward(localPort: Self.freeLocalPort(), remotePort: remotePort)
+    }
+
+    private func requestForward(localPort: Int, remotePort: Int) async throws -> Int {
         let specification = "127.0.0.1:\(localPort):127.0.0.1:\(remotePort)"
         let result = await Self.runSSH(
             arguments: controlArguments + ["-O", "forward", "-L", specification, destination],
