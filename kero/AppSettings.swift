@@ -486,7 +486,7 @@ enum TOML {
         return result
     }
 
-    private static func parseValue(_ raw: String) -> Value? {
+    static func parseValue(_ raw: String) -> Value? {
         if raw.hasPrefix("\"") {
             var out = ""
             var escaped = false

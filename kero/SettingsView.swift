@@ -218,6 +218,11 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Port Forwarding") {
+                TunnelSettingsRow()
+                    .frame(height: 176)
+            }
+
             Section("Text Editing") {
                 Toggle("Wrap lines to editor width", isOn: $settings.wrapLines)
             }

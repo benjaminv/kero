@@ -2875,10 +2875,11 @@ private struct InfoPortRow: View {
             : "http://localhost:\(port.port)"
     }
 
-    /// The port cell: the remote number alone, or both numbers once forwarded,
-    /// so it is clear which machine each belongs to.
+    /// The port cell: the remote number alone, or both numbers once forwarded
+    /// to a different local port, so a mismatch is obvious. A forward on the
+    /// same number, the usual case, needs no arrow.
     private var portLabel: String {
-        guard let localPort else { return String(port.port) }
+        guard let localPort, localPort != port.port else { return String(port.port) }
         return "\(port.port) → \(localPort)"
     }
 

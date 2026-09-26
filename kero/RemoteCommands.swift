@@ -62,6 +62,68 @@ nonisolated enum RemoteCommands {
         return port == 0 ? nil : port
     }
 
+    /// Whether nothing on this Mac is listening on `port` where `localhost`
+    /// could reach it, so a forward on that number would be the only thing
+    /// answering there.
+    ///
+    /// Probes four binds, each with `SO_REUSEADDR`: `127.0.0.1`, `0.0.0.0`,
+    /// `::1` and `::`. The option is what ssh sets on its own listener, and it
+    /// makes the probe ignore connections lingering in TIME_WAIT (30 s on
+    /// macOS), which follow every forward whose side closed first. Without it
+    /// a forward that was just dropped, after a wake or a reconnect, would
+    /// read as busy and move to a different port. The cost is that on macOS a
+    /// reusable bind to `127.0.0.1:N` succeeds beside a server on `*:N`, so
+    /// the wildcard addresses are probed too: binding the exact address a live
+    /// listener holds fails even with the option.
+    ///
+    /// Both families matter because `localhost` can resolve to `::1` first on
+    /// macOS: a local process on `[::1]:N` would win over an IPv4 forward.
+    /// A Mac with no IPv6 just skips those two.
+    static func isLocalPortFree(_ port: UInt16) -> Bool {
+        guard port != 0 else { return false }
+        return canBind(family: AF_INET, loopback: true, port: port)
+            && canBind(family: AF_INET, loopback: false, port: port)
+            && canBind(family: AF_INET6, loopback: true, port: port)
+            && canBind(family: AF_INET6, loopback: false, port: port)
+    }
+
+    private static func canBind(family: Int32, loopback: Bool, port: UInt16) -> Bool {
+        let descriptor = socket(family, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return family == AF_INET6 && errno == EAFNOSUPPORT }
+        defer { close(descriptor) }
+        var reuse: Int32 = 1
+        setsockopt(
+            descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        let bound: Int32
+        if family == AF_INET6 {
+            var address = sockaddr_in6()
+            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            address.sin6_family = sa_family_t(AF_INET6)
+            address.sin6_port = port.bigEndian
+            address.sin6_addr = loopback ? in6addr_loopback : in6addr_any
+            bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+        } else {
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = port.bigEndian
+            address.sin_addr.s_addr = (loopback ? INADDR_LOOPBACK : INADDR_ANY).bigEndian
+            bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        if bound == 0 { return true }
+        // No IPv6 loopback configured: nothing can be listening there either.
+        return family == AF_INET6 && errno == EADDRNOTAVAIL
+    }
+
     /// The `-L` argument. Always bound to loopback: a forwarded remote port
     /// must never be reachable from the local network.
     static func forwardSpec(localPort: UInt16, remotePort: UInt16) -> String {
@@ -532,6 +594,30 @@ extension RemoteCommands {
                 controlSocket: "/tmp/k.sock", destination: "oracle",
                 localPort: 64444, remotePort: 22)[3] == "cancel")
         if let port = freeLocalPort() { assert(port >= 1024) }
+
+        // Hold a loopback port open: the probe must see it busy, then free
+        // once it is released.
+        let held = socket(AF_INET, SOCK_STREAM, 0)
+        var heldAddress = sockaddr_in()
+        heldAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        heldAddress.sin_family = sa_family_t(AF_INET)
+        heldAddress.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+        var heldLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let listening = withUnsafeMutablePointer(to: &heldAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(held, $0, heldLength) == 0 && listen(held, 1) == 0
+                    && getsockname(held, $0, &heldLength) == 0
+            }
+        }
+        let heldPort = UInt16(bigEndian: heldAddress.sin_port)
+        if held >= 0, listening, heldPort != 0 {
+            assert(!isLocalPortFree(heldPort))
+            close(held)
+            assert(isLocalPortFree(heldPort))
+        } else {
+            close(held)
+        }
+        assert(!isLocalPortFree(0))
 
         // The variable must reach the remote shell unexpanded.
         let discovery = shellDiscoveryCommand()

@@ -17,6 +17,9 @@ struct keroApp: App {
         TerminalFont.registerBundledFonts()
         TerminalNotificationService.shared.configure()
         AppSettings.shared.reconcileAIEnabled()
+        // Saved forwards are for other apps too (an RDP client, a browser),
+        // so they open at launch rather than when Settings is first shown.
+        TunnelManager.shared.start()
     }
 
     var body: some Scene {
