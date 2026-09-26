@@ -8,7 +8,10 @@ import Combine
 import SwiftUI
 
 /// The Port Forwarding section of Settings: saved forwards with a switch,
-/// what each reaches, its local port and a live status in words.
+/// the name over its route (listener → target) and a live status in words.
+///
+/// Three columns and two-line rows: the Settings pane is 440 pt wide and
+/// not resizable, and a column per fact truncated every cell at that width.
 ///
 /// AppKit-owned, mounted into the legacy SwiftUI Settings form through
 /// ``TunnelSettingsRow`` like the terminal cursor rows.
@@ -16,9 +19,7 @@ import SwiftUI
 final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private enum Column {
         static let enabled = NSUserInterfaceItemIdentifier("enabled")
-        static let name = NSUserInterfaceItemIdentifier("name")
-        static let remote = NSUserInterfaceItemIdentifier("remote")
-        static let local = NSUserInterfaceItemIdentifier("local")
+        static let route = NSUserInterfaceItemIdentifier("route")
         static let status = NSUserInterfaceItemIdentifier("status")
     }
 
@@ -59,27 +60,31 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
     // MARK: - Layout
 
     private func buildTable() {
-        let columns: [(NSUserInterfaceItemIdentifier, String, CGFloat)] = [
-            (Column.enabled, "", 24),
-            (Column.name, String(localized: "Name"), 110),
-            (Column.remote, String(localized: "Forwards to"), 150),
-            (Column.local, String(localized: "Local port"), 70),
-            (Column.status, String(localized: "Status"), 150),
+        // Only the route column takes the width the pane leaves: the switch
+        // and the status word are fixed. Its minimum has to stay well under
+        // what the pane offers beside them, about 260 pt with the scroller
+        // showing, or the table overflows its clip view and the status
+        // column is cut off instead.
+        let columns: [(NSUserInterfaceItemIdentifier, String, CGFloat, CGFloat)] = [
+            (Column.enabled, "", 24, 24),
+            (Column.route, String(localized: "Forward"), 200, 120),
+            (Column.status, String(localized: "Status"), 96, 96),
         ]
-        for (identifier, title, width) in columns {
+        for (identifier, title, width, minimum) in columns {
             let column = NSTableColumn(identifier: identifier)
             column.title = title
             column.width = width
-            column.minWidth = identifier == Column.enabled ? 24 : 50
-            if identifier == Column.enabled { column.maxWidth = 24 }
+            column.minWidth = minimum
+            column.resizingMask = identifier == Column.route ? .autoresizingMask : []
+            if identifier != Column.route { column.maxWidth = width }
             tableView.addTableColumn(column)
         }
         tableView.dataSource = self
         tableView.delegate = self
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.allowsMultipleSelection = false
-        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-        tableView.rowHeight = 22
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.rowHeight = 40
         tableView.style = .inset
         tableView.target = self
         tableView.doubleAction = #selector(editClickedRow)
@@ -200,23 +205,22 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         }
     }
 
-    /// The status in words, never by color alone.
-    private func statusText(for tunnel: TunnelDefinition) -> (text: String, detail: String?) {
-        guard tunnel.isEnabled else { return (String(localized: "Off"), nil) }
+    /// The status in words, never by color alone: one word on the first
+    /// line, the retry countdown under it, and ssh's reason as the tooltip
+    /// and accessibility value, since a 96 pt column can't hold it.
+    private func statusText(for tunnel: TunnelDefinition) -> (text: String, detail: String?, reason: String?) {
+        guard tunnel.isEnabled else { return (String(localized: "Off"), nil, nil) }
         switch manager.state(for: tunnel.id) {
         case .stopped:
-            return (String(localized: "Stopped"), nil)
+            return (String(localized: "Stopped"), nil, nil)
         case .connecting:
-            return (String(localized: "Connecting…"), nil)
+            return (String(localized: "Connecting…"), nil, nil)
         case .up:
-            return (String(localized: "Connected"), nil)
+            return (String(localized: "Connected"), nil, nil)
         case .failed(let message, let retryAt):
-            guard let retryAt else { return (String(localized: "Failed: \(message)"), message) }
+            guard let retryAt else { return (String(localized: "Failed"), nil, message) }
             let seconds = max(0, Int(retryAt.timeIntervalSinceNow.rounded(.up)))
-            return (
-                String(localized: "Failed, retrying in \(String(seconds)) s: \(message)"),
-                message
-            )
+            return (String(localized: "Failed"), String(localized: "retrying in \(String(seconds)) s"), message)
         }
     }
 
@@ -238,49 +242,29 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         }
 
         let identifier = tableColumn.identifier
-        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView)
-            ?? makeTextCell(identifier: identifier)
-        let field = cell.textField
-        field?.toolTip = nil
+        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? TwoLineCellView)
+            ?? TwoLineCellView(identifier: identifier)
         switch identifier {
-        case Column.name:
-            field?.stringValue = tunnel.name
-        case Column.remote:
-            field?.stringValue = tunnel.remoteDescription
-        case Column.local:
-            field?.stringValue = String(tunnel.localPort)
+        case Column.route:
+            let route = tunnel.routeDescription
+            cell.title.stringValue = tunnel.name
+            cell.subtitle.stringValue = route
+            // The full text for a route too long for the column.
+            cell.toolTip = "\(tunnel.name)\n\(route)"
+            cell.title.setAccessibilityValue("\(tunnel.name), \(route)")
         default:
             let status = statusText(for: tunnel)
-            field?.stringValue = status.text
-            field?.toolTip = status.detail
+            cell.title.stringValue = status.text
+            cell.subtitle.stringValue = status.detail ?? ""
+            cell.toolTip = status.reason
+            cell.title.setAccessibilityValue(
+                [status.text, status.detail, status.reason].compactMap { $0 }.joined(separator: ", "))
         }
         return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         addRemoveControl.setEnabled(selectedTunnel != nil, forSegment: 1)
-    }
-
-    private func makeTextCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
-        let cell = NSTableCellView()
-        cell.identifier = identifier
-        let field = NSTextField(labelWithString: "")
-        field.lineBreakMode = .byTruncatingTail
-        field.translatesAutoresizingMaskIntoConstraints = false
-        if identifier == Column.local {
-            field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        }
-        if identifier == Column.status || identifier == Column.remote {
-            field.textColor = .secondaryLabelColor
-        }
-        cell.addSubview(field)
-        cell.textField = field
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
     }
 
     // MARK: - Context menu
@@ -294,7 +278,14 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
             item.representedObject = tunnel.id
             return item
         }
-        menu.addItem(item(String(localized: "Copy Local Address"), #selector(copyLocalAddress(_:))))
+        // The address is loopback on whichever machine listens: pasted into
+        // a local app for a local forward, into a remote shell for a remote one.
+        let copyTitle =
+            switch tunnel.direction {
+            case .local: String(localized: "Copy Local Address")
+            case .remote: String(localized: "Copy Remote Address")
+            }
+        menu.addItem(item(copyTitle, #selector(copyListenAddress(_:))))
         if tunnel.isEnabled {
             menu.addItem(item(String(localized: "Reconnect"), #selector(restartTunnel(_:))))
         }
@@ -308,11 +299,11 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
     @objc private func enabledToggled(_ sender: NSButton) {
         guard let tunnel = tunnel(at: sender.tag) else { return }
         let enable = sender.state == .on
-        if enable, let other = manager.conflict(localPort: tunnel.localPort, excluding: tunnel.id) {
+        if enable, let other = manager.conflict(with: tunnel) {
             sender.state = .off
             showAlert(
-                String(localized: "Local port \(String(tunnel.localPort)) is already used by “\(other.name)”."),
-                detail: String(localized: "Turn that forward off or give this one a different local port."))
+                TunnelSettingsView.conflictMessage(for: tunnel, with: other),
+                detail: String(localized: "Turn that forward off or give this one a different port."))
             return
         }
         manager.setEnabled(enable, id: tunnel.id)
@@ -331,10 +322,10 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         presentEditor(for: tunnel)
     }
 
-    @objc private func copyLocalAddress(_ sender: NSMenuItem) {
+    @objc private func copyListenAddress(_ sender: NSMenuItem) {
         guard let tunnel = tunnel(withID: sender.representedObject) else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(tunnel.localAddress, forType: .string)
+        NSPasteboard.general.setString(tunnel.listenAddress, forType: .string)
     }
 
     @objc private func restartTunnel(_ sender: NSMenuItem) {
@@ -371,6 +362,18 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         editor.present(on: window)
     }
 
+    /// Why `tunnel` can't be switched on beside `other`, naming the machine
+    /// that would have to listen twice.
+    static func conflictMessage(for tunnel: TunnelDefinition, with other: TunnelDefinition) -> String {
+        switch tunnel.direction {
+        case .local:
+            String(localized: "Local port \(String(tunnel.localPort)) is already used by “\(other.name)”.")
+        case .remote:
+            String(
+                localized: "Port \(String(tunnel.remotePort)) on \(tunnel.host) is already used by “\(other.name)”.")
+        }
+    }
+
     private func showAlert(_ message: String, detail: String) {
         let alert = NSAlert()
         alert.messageText = message
@@ -383,11 +386,50 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
     }
 }
 
+// MARK: - Two-line cell
+
+/// A name over a secondary line, for a row that carries two facts in one
+/// column. `title` doubles as the cell's `textField` so the table treats it
+/// as the row's text.
+@MainActor
+private final class TwoLineCellView: NSTableCellView {
+    let title = NSTextField(labelWithString: "")
+    let subtitle = NSTextField(labelWithString: "")
+
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        subtitle.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        subtitle.textColor = .secondaryLabelColor
+        for field in [title, subtitle] {
+            field.lineBreakMode = .byTruncatingTail
+            field.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(field)
+        }
+        textField = title
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
 // MARK: - Editor sheet
 
-/// The add/edit sheet: name, host, remote host and port, local port, and
-/// whether to open it now. Validation runs on Save and keeps the sheet open
-/// with the reason shown under the fields.
+/// The add/edit sheet: name, direction, host, the port to listen on, what
+/// it reaches, and whether to open it now. The direction picker relabels
+/// the port rows and swaps which host row is shown, so the sheet always
+/// reads as one listener and one target. Validation runs on Save and keeps
+/// the sheet open with the reason shown under the fields.
 @MainActor
 private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
     var onSave: ((TunnelDefinition) -> Void)?
@@ -395,12 +437,27 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
     private let existing: TunnelDefinition?
     private let sheet: NSWindow
     private let nameField = NSTextField()
+    private let directionPopUp = NSPopUpButton()
     private let hostField = NSTextField()
     private let remoteHostField = NSTextField()
     private let remotePortField = NSTextField()
+    private let localHostField = NSTextField()
     private let localPortField = NSTextField()
+    private let remoteHostLabel = NSTextField(labelWithString: "")
+    private let remotePortLabel = NSTextField(labelWithString: "")
+    private let localHostLabel = NSTextField(labelWithString: "")
+    private let localPortLabel = NSTextField(labelWithString: "")
+    private var remoteHostRow: NSGridRow?
+    private var localHostRow: NSGridRow?
     private let enabledCheckbox = NSButton(
         checkboxWithTitle: String(localized: "Keep this forward open"), target: nil, action: nil)
+    /// Only a remote forward exposes something on this Mac, so only that
+    /// direction says what it is exposing and to whom.
+    private let exposureNote = NSTextField(
+        wrappingLabelWithString: String(
+            localized:
+                "Anything that can reach that port on the remote machine reaches this Mac through it. To reach this Mac's own ssh, turn on Remote Login in System Settings → General → Sharing."
+        ))
     private let problemLabel = NSTextField(wrappingLabelWithString: "")
     /// Until the user types a local port, it follows the remote one, since
     /// the same number is what pages that hardcode their own port need.
@@ -408,10 +465,14 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
     /// Keeps the controller alive while its sheet is up.
     private var retainedSelf: TunnelEditorController?
 
+    private var direction: TunnelDirection {
+        TunnelDirection.allCases[max(0, directionPopUp.indexOfSelectedItem)]
+    }
+
     init(existing: TunnelDefinition?) {
         self.existing = existing
         sheet = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 10),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 10),
             styleMask: [.titled], backing: .buffered, defer: true)
         super.init()
         build()
@@ -429,40 +490,61 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
         let tunnel = existing
         nameField.stringValue = tunnel?.name ?? ""
         nameField.placeholderString = String(localized: "A1 desktop")
+        // In the order of TunnelDirection.allCases, which `direction` relies on.
+        directionPopUp.addItems(withTitles: [
+            String(localized: "Reach a remote port from this Mac"),
+            String(localized: "Let the remote machine reach this Mac"),
+        ])
+        directionPopUp.selectItem(
+            at: TunnelDirection.allCases.firstIndex(of: tunnel?.direction ?? .local) ?? 0)
+        directionPopUp.target = self
+        directionPopUp.action = #selector(directionChanged)
         hostField.stringValue = tunnel?.host ?? ""
         hostField.placeholderString = String(localized: "oracle or user@host")
         remoteHostField.stringValue = tunnel?.remoteHost ?? "127.0.0.1"
         remotePortField.stringValue = tunnel.map { String($0.remotePort) } ?? ""
-        remotePortField.placeholderString = "3389"
+        localHostField.stringValue = tunnel?.localHost ?? "127.0.0.1"
         localPortField.stringValue = tunnel.map { String($0.localPort) } ?? ""
-        localPortField.placeholderString = String(localized: "Same as remote")
         enabledCheckbox.state = (tunnel?.isEnabled ?? true) ? .on : .off
         localPortEdited = tunnel != nil
         remotePortField.delegate = self
         localPortField.delegate = self
 
-        for field in [nameField, hostField, remoteHostField, remotePortField, localPortField] {
+        for field in [nameField, hostField, remoteHostField, remotePortField, localHostField, localPortField] {
             field.translatesAutoresizingMaskIntoConstraints = false
             field.widthAnchor.constraint(equalToConstant: 240).isActive = true
         }
+        directionPopUp.translatesAutoresizingMaskIntoConstraints = false
+        directionPopUp.widthAnchor.constraint(equalToConstant: 240).isActive = true
 
         func label(_ text: String) -> NSTextField {
             let label = NSTextField(labelWithString: text)
             label.alignment = .right
             return label
         }
+        for portLabel in [remoteHostLabel, remotePortLabel, localHostLabel, localPortLabel] {
+            portLabel.alignment = .right
+        }
         let grid = NSGridView(views: [
             [label(String(localized: "Name:")), nameField],
+            [label(String(localized: "Direction:")), directionPopUp],
             [label(String(localized: "SSH host:")), hostField],
-            [label(String(localized: "Remote host:")), remoteHostField],
-            [label(String(localized: "Remote port:")), remotePortField],
-            [label(String(localized: "Local port:")), localPortField],
+            [remoteHostLabel, remoteHostField],
+            [remotePortLabel, remotePortField],
+            [localHostLabel, localHostField],
+            [localPortLabel, localPortField],
             [NSGridCell.emptyContentView, enabledCheckbox],
         ])
         grid.rowSpacing = 8
         grid.columnSpacing = 8
         grid.column(at: 0).xPlacement = .trailing
         grid.translatesAutoresizingMaskIntoConstraints = false
+        remoteHostRow = grid.row(at: 3)
+        localHostRow = grid.row(at: 5)
+
+        exposureNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        exposureNote.textColor = .secondaryLabelColor
+        exposureNote.translatesAutoresizingMaskIntoConstraints = false
 
         problemLabel.textColor = .systemRed
         problemLabel.isHidden = true
@@ -474,36 +556,71 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
         let saveButton = NSButton(
             title: String(localized: "Save"), target: self, action: #selector(saveClicked))
         saveButton.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [cancelButton, saveButton])
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
         buttons.spacing = 8
-        buttons.translatesAutoresizingMaskIntoConstraints = false
+        buttons.addView(cancelButton, in: .trailing)
+        buttons.addView(saveButton, in: .trailing)
+
+        // A stack rather than a constraint chain: the exposure note and the
+        // problem label come and go, and a stack drops a hidden view from the
+        // layout along with its spacing.
+        let stack = NSStackView(views: [grid, exposureNote, problemLabel, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.setCustomSpacing(12, after: problemLabel)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
         let content = NSView()
-        content.addSubview(grid)
-        content.addSubview(problemLabel)
-        content.addSubview(buttons)
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
-
-            problemLabel.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 10),
-            problemLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            problemLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-
-            buttons.topAnchor.constraint(equalTo: problemLabel.bottomAnchor, constant: 12),
-            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            content.widthAnchor.constraint(equalToConstant: 440),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            exposureNote.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -20),
+            problemLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -20),
+            buttons.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -20),
         ])
         sheet.contentView = content
-        sheet.setContentSize(content.fittingSize)
+        applyDirection()
+    }
+
+    /// Relabels the port rows, shows the host row for the target side only,
+    /// and resizes the sheet to fit.
+    private func applyDirection() {
+        switch direction {
+        case .local:
+            remoteHostLabel.stringValue = String(localized: "Remote host:")
+            remotePortLabel.stringValue = String(localized: "Remote port:")
+            localPortLabel.stringValue = String(localized: "Local port:")
+            remotePortField.placeholderString = "3389"
+            localPortField.placeholderString = String(localized: "Same as remote")
+        case .remote:
+            remotePortLabel.stringValue = String(localized: "Remote port:")
+            localHostLabel.stringValue = String(localized: "Local host:")
+            localPortLabel.stringValue = String(localized: "Local port:")
+            remotePortField.placeholderString = "2222"
+            localPortField.placeholderString = "22"
+        }
+        remoteHostRow?.isHidden = direction != .local
+        localHostRow?.isHidden = direction != .remote
+        exposureNote.isHidden = direction != .remote
+        sheet.setContentSize(sheet.contentView?.fittingSize ?? sheet.frame.size)
+    }
+
+    @objc private func directionChanged() {
+        applyDirection()
     }
 
     func controlTextDidChange(_ notification: Notification) {
         guard let field = notification.object as? NSTextField else { return }
         if field === localPortField {
             localPortEdited = !localPortField.stringValue.isEmpty
-        } else if field === remotePortField, !localPortEdited,
+        } else if field === remotePortField, !localPortEdited, direction == .local,
             let remote = Int(remotePortField.stringValue),
             TunnelDefinition.localPortRange.contains(remote)
         {
@@ -530,20 +647,19 @@ private final class TunnelEditorController: NSObject, NSTextFieldDelegate {
         let name = trimmed(nameField)
         var tunnel = existing ?? TunnelDefinition(name: "", host: "", localPort: 0, remotePort: 0)
         tunnel.name = name.isEmpty ? "\(host):\(remotePort)" : name
+        tunnel.direction = direction
         tunnel.host = host
         tunnel.remoteHost = trimmed(remoteHostField)
         tunnel.remotePort = remotePort
+        tunnel.localHost = trimmed(localHostField)
         tunnel.localPort = localPort
         tunnel.isEnabled = enabledCheckbox.state == .on
 
         if let problem = tunnel.validationProblem {
             return show(problem)
         }
-        if tunnel.isEnabled,
-            let other = TunnelManager.shared.conflict(localPort: localPort, excluding: tunnel.id)
-        {
-            return show(
-                String(localized: "Local port \(String(localPort)) is already used by “\(other.name)”."))
+        if tunnel.isEnabled, let other = TunnelManager.shared.conflict(with: tunnel) {
+            return show(TunnelSettingsView.conflictMessage(for: tunnel, with: other))
         }
         onSave?(tunnel)
         sheet.sheetParent?.endSheet(sheet, returnCode: .OK)

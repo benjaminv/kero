@@ -16,7 +16,7 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
-- Keep saved port forwards open in the background from Settings → Port Forwarding, so other apps such as a remote desktop client or a browser can reach a remote machine without a terminal connected; forwards use your ssh keys and ~/.ssh/config, reconnect after sleep or a network drop, and show their status in words
+- Keep saved port forwards open in the background from Settings → Port Forwarding, so other apps such as a remote desktop client or a browser can reach a remote machine without a terminal connected; a forward can also run the other way, letting the remote machine reach a port on this Mac such as its own ssh; forwards use your ssh keys and ~/.ssh/config, reconnect after sleep or a network drop, and show their status in words
 - Work on a remote machine over SSH: when a terminal pane runs `ssh`, the Files, Git, and Info panels, the editor, and the diff viewer follow the remote machine and its working directory, remote listening ports can be forwarded, on the same port number when it is free on this Mac, and opened locally, and open remote files stay readable but read-only if the connection drops
 
 ## [0.1.48]
