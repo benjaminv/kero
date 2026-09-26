@@ -10,7 +10,7 @@ import SwiftUI
 /// The Port Forwarding section of Settings: saved forwards with a switch,
 /// the name over its route (listener → target) and a live status in words.
 ///
-/// Three columns and two-line rows: the Settings pane is 440 pt wide and
+/// Three columns and two-line rows: the Settings pane is 600 pt wide and
 /// not resizable, and a column per fact truncated every cell at that width.
 ///
 /// AppKit-owned, mounted into the legacy SwiftUI Settings form through
