@@ -14,7 +14,7 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
-## [unreleased]
+## [0.1.48-remote.1]
 
 - Kero Remote no longer checks for updates or offers upstream Kero releases; the Check for Updates command and the Updates settings are gone from that build
 - Keep saved port forwards open in the background from Settings → Port Forwarding, so other apps such as a remote desktop client or a browser can reach a remote machine without a terminal connected; a forward can also run the other way, letting the remote machine reach a port on this Mac such as its own ssh; forwards use your ssh keys and ~/.ssh/config, reconnect after sleep or a network drop, and show their status in words
