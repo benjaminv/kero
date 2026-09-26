@@ -33,7 +33,9 @@ struct keroApp: App {
         .defaultSize(width: 900, height: 600)
         .commands {
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesView(updater: updater)
+                if updater.isAvailable {
+                    CheckForUpdatesView(updater: updater)
+                }
             }
             KeroCommands()
         }

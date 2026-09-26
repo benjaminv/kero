@@ -370,6 +370,8 @@
 				);
 				INFOPLIST_FILE = kero/Info.plist;
 				KERO_DISPLAY_NAME = "Kero Debug";
+				KERO_UPDATE_FEED_URL = "https://releases.kero.sh/appcast.xml";
+				KERO_UPDATE_PUBLIC_KEY = "gv9GLMPjH5yMQkZMFXnoNfHOyL8/7KGzl/jzAqlzZZY=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -417,6 +419,8 @@
 				);
 				INFOPLIST_FILE = kero/Info.plist;
 				KERO_DISPLAY_NAME = Kero;
+				KERO_UPDATE_FEED_URL = "https://releases.kero.sh/appcast.xml";
+				KERO_UPDATE_PUBLIC_KEY = "gv9GLMPjH5yMQkZMFXnoNfHOyL8/7KGzl/jzAqlzZZY=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

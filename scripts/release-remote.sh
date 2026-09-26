@@ -56,6 +56,7 @@ xcodebuild -project kero.xcodeproj -scheme kero -configuration Release \
   -derivedDataPath "$DERIVED" \
   KERO_DISPLAY_NAME="$APP_NAME" \
   ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon-Remote \
+  KERO_UPDATE_FEED_URL= KERO_UPDATE_PUBLIC_KEY= \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
   build -quiet
 restore_pbxproj
@@ -63,6 +64,12 @@ trap - EXIT
 
 APP="$DERIVED/Build/Products/Release/${APP_NAME}.app"
 [ -d "$APP" ] || { echo "ERROR: app not found at $APP" >&2; exit 1; }
+
+# Kero Remote has no update feed: releases are GitHub assets installed by
+# hand, and upstream's appcast would offer plain Kero over this app.
+echo "==> Checking update feed is empty..."
+[ -z "$(plutil -extract SUFeedURL raw "$APP/Contents/Info.plist")" ] \
+  || { echo "ERROR: app still carries an update feed URL" >&2; exit 1; }
 
 echo "==> Checking bundle identifiers..."
 [ "$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")" = "$BUNDLE_ID" ] \
