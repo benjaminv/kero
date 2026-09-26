@@ -11,12 +11,19 @@ import SwiftUI
 /// "Check for Updates…" menu item and the Settings toggle both drive it.
 ///
 /// The feed URL and the public EdDSA key are read from Info.plist, injected via
-/// the `INFOPLIST_KEY_SUFeedURL` and `INFOPLIST_KEY_SUPublicEDKey` build
-/// settings. See RELEASING.md for generating the signing keys and publishing
-/// updates.
+/// the `KERO_UPDATE_FEED_URL` and `KERO_UPDATE_PUBLIC_KEY` build settings. See
+/// RELEASING.md for generating the signing keys and publishing updates.
+///
+/// A build with an empty feed URL (Kero Remote, see scripts/release-remote.sh)
+/// has nowhere to check, so the updater never starts and `isAvailable` lets the
+/// menu item and the Settings section stay out of the way instead of offering
+/// upstream's releases over a differently branded app.
 @MainActor
 final class Updater: ObservableObject {
     static let shared = Updater()
+
+    /// False when the bundle carries no feed URL.
+    let isAvailable: Bool
 
     private let controller: SPUStandardUpdaterController
 
@@ -38,10 +45,12 @@ final class Updater: ObservableObject {
         // background check and pops Sparkle's "check for updates
         // automatically?" permission prompt, which is just noise while
         // developing. Release builds start it and behave normally.
+        let feedURL = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String ?? ""
+        isAvailable = !feedURL.isEmpty
         #if DEBUG
         let startImmediately = false
         #else
-        let startImmediately = true
+        let startImmediately = isAvailable
         #endif
         controller = SPUStandardUpdaterController(
             startingUpdater: startImmediately,

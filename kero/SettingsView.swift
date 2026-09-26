@@ -235,16 +235,18 @@ struct SettingsView: View {
                 .frame(minHeight: 44)
             }
 
-            Section("Updates") {
-                Toggle(
-                    "Automatically check for updates",
-                    isOn: $updater.automaticallyChecksForUpdates
-                )
+            if updater.isAvailable {
+                Section("Updates") {
+                    Toggle(
+                        "Automatically check for updates",
+                        isOn: $updater.automaticallyChecksForUpdates
+                    )
 
-                Button("Check for Updates…") {
-                    updater.checkForUpdates()
+                    Button("Check for Updates…") {
+                        updater.checkForUpdates()
+                    }
+                    .disabled(!updater.canCheckForUpdates)
                 }
-                .disabled(!updater.canCheckForUpdates)
             }
 
             Section {
