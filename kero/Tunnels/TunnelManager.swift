@@ -310,7 +310,10 @@ private final class TunnelRunner {
 
         process.terminationHandler = { [weak self] finished in
             let status = finished.terminationStatus
-            Task { @MainActor in
+            // Re-captured here: the outer weak `self` is a var, and a var
+            // referenced from a concurrently-executing closure is an error in
+            // the Swift 6 language mode.
+            Task { @MainActor [weak self] in
                 self?.processExited(finished, status: status)
             }
         }

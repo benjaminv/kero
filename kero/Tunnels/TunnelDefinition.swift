@@ -71,19 +71,14 @@ nonisolated struct TunnelDefinition: Identifiable, Equatable {
     /// Where the forward can be connected to, on whichever machine listens.
     var listenAddress: String { "127.0.0.1:\(listenPort)" }
 
-    /// Where the forward listens, as the settings table shows it.
-    var listenDescription: String {
+    /// Listener to target in one line, as the settings table shows it under
+    /// the name: where to connect, then what answers there.
+    var routeDescription: String {
         switch direction {
-        case .local: String(localized: "This Mac, port \(String(localPort))")
-        case .remote: String(localized: "\(host), port \(String(remotePort))")
-        }
-    }
-
-    /// What the forward reaches, as the settings table and log lines show it.
-    var targetDescription: String {
-        switch direction {
-        case .local: "\(host) → \(remoteHost):\(remotePort)"
-        case .remote: String(localized: "This Mac → \(localHost):\(localPort)")
+        case .local:
+            String(localized: "This Mac:\(String(localPort)) → \(remoteHost):\(String(remotePort)) on \(host)")
+        case .remote:
+            String(localized: "\(host):\(String(remotePort)) → \(localHost):\(String(localPort)) on this Mac")
         }
     }
 
@@ -280,6 +275,8 @@ extension TunnelStore {
         assert(parsed[1].localPort == 22 && parsed[1].remotePort == 2222)
         assert(parsed[1].forwardSpecification == "127.0.0.1:2222:127.0.0.1:22")
         assert(parsed[1].listenPort == 2222 && parsed[1].listenAddress == "127.0.0.1:2222")
+        assert(parsed[0].routeDescription.hasPrefix("This Mac:13389 → 127.0.0.1:3389"))
+        assert(parsed[1].routeDescription.hasPrefix("oracle:2222 → 127.0.0.1:22"))
         assert(parsed[1].validationProblem == nil)
 
         let mixed = """

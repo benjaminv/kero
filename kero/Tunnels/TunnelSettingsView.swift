@@ -8,7 +8,10 @@ import Combine
 import SwiftUI
 
 /// The Port Forwarding section of Settings: saved forwards with a switch,
-/// where each listens, what it reaches and a live status in words.
+/// the name over its route (listener → target) and a live status in words.
+///
+/// Three columns and two-line rows: the Settings pane is 440 pt wide and
+/// not resizable, and a column per fact truncated every cell at that width.
 ///
 /// AppKit-owned, mounted into the legacy SwiftUI Settings form through
 /// ``TunnelSettingsRow`` like the terminal cursor rows.
@@ -16,9 +19,7 @@ import SwiftUI
 final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private enum Column {
         static let enabled = NSUserInterfaceItemIdentifier("enabled")
-        static let name = NSUserInterfaceItemIdentifier("name")
-        static let listen = NSUserInterfaceItemIdentifier("listen")
-        static let target = NSUserInterfaceItemIdentifier("target")
+        static let route = NSUserInterfaceItemIdentifier("route")
         static let status = NSUserInterfaceItemIdentifier("status")
     }
 
@@ -61,16 +62,17 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
     private func buildTable() {
         let columns: [(NSUserInterfaceItemIdentifier, String, CGFloat)] = [
             (Column.enabled, "", 24),
-            (Column.name, String(localized: "Name"), 100),
-            (Column.listen, String(localized: "Listens on"), 130),
-            (Column.target, String(localized: "Reaches"), 150),
-            (Column.status, String(localized: "Status"), 150),
+            (Column.route, String(localized: "Forward"), 250),
+            (Column.status, String(localized: "Status"), 96),
         ]
         for (identifier, title, width) in columns {
             let column = NSTableColumn(identifier: identifier)
             column.title = title
             column.width = width
-            column.minWidth = identifier == Column.enabled ? 24 : 50
+            column.minWidth = width
+            // Only the route column takes the width the pane leaves: the
+            // switch and the status word are fixed.
+            column.resizingMask = identifier == Column.route ? .autoresizingMask : []
             if identifier == Column.enabled { column.maxWidth = 24 }
             tableView.addTableColumn(column)
         }
@@ -78,8 +80,8 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         tableView.delegate = self
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.allowsMultipleSelection = false
-        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-        tableView.rowHeight = 22
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.rowHeight = 40
         tableView.style = .inset
         tableView.target = self
         tableView.doubleAction = #selector(editClickedRow)
@@ -200,23 +202,22 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         }
     }
 
-    /// The status in words, never by color alone.
-    private func statusText(for tunnel: TunnelDefinition) -> (text: String, detail: String?) {
-        guard tunnel.isEnabled else { return (String(localized: "Off"), nil) }
+    /// The status in words, never by color alone: one word on the first
+    /// line, the retry countdown under it, and ssh's reason as the tooltip
+    /// and accessibility value, since a 96 pt column can't hold it.
+    private func statusText(for tunnel: TunnelDefinition) -> (text: String, detail: String?, reason: String?) {
+        guard tunnel.isEnabled else { return (String(localized: "Off"), nil, nil) }
         switch manager.state(for: tunnel.id) {
         case .stopped:
-            return (String(localized: "Stopped"), nil)
+            return (String(localized: "Stopped"), nil, nil)
         case .connecting:
-            return (String(localized: "Connecting…"), nil)
+            return (String(localized: "Connecting…"), nil, nil)
         case .up:
-            return (String(localized: "Connected"), nil)
+            return (String(localized: "Connected"), nil, nil)
         case .failed(let message, let retryAt):
-            guard let retryAt else { return (String(localized: "Failed: \(message)"), message) }
+            guard let retryAt else { return (String(localized: "Failed"), nil, message) }
             let seconds = max(0, Int(retryAt.timeIntervalSinceNow.rounded(.up)))
-            return (
-                String(localized: "Failed, retrying in \(String(seconds)) s: \(message)"),
-                message
-            )
+            return (String(localized: "Failed"), String(localized: "retrying in \(String(seconds)) s"), message)
         }
     }
 
@@ -238,46 +239,29 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         }
 
         let identifier = tableColumn.identifier
-        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView)
-            ?? makeTextCell(identifier: identifier)
-        let field = cell.textField
-        field?.toolTip = nil
+        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? TwoLineCellView)
+            ?? TwoLineCellView(identifier: identifier)
         switch identifier {
-        case Column.name:
-            field?.stringValue = tunnel.name
-        case Column.listen:
-            field?.stringValue = tunnel.listenDescription
-        case Column.target:
-            field?.stringValue = tunnel.targetDescription
+        case Column.route:
+            let route = tunnel.routeDescription
+            cell.title.stringValue = tunnel.name
+            cell.subtitle.stringValue = route
+            // The full text for a route too long for the column.
+            cell.toolTip = "\(tunnel.name)\n\(route)"
+            cell.title.setAccessibilityValue("\(tunnel.name), \(route)")
         default:
             let status = statusText(for: tunnel)
-            field?.stringValue = status.text
-            field?.toolTip = status.detail
+            cell.title.stringValue = status.text
+            cell.subtitle.stringValue = status.detail ?? ""
+            cell.toolTip = status.reason
+            cell.title.setAccessibilityValue(
+                [status.text, status.detail, status.reason].compactMap { $0 }.joined(separator: ", "))
         }
         return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         addRemoveControl.setEnabled(selectedTunnel != nil, forSegment: 1)
-    }
-
-    private func makeTextCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
-        let cell = NSTableCellView()
-        cell.identifier = identifier
-        let field = NSTextField(labelWithString: "")
-        field.lineBreakMode = .byTruncatingTail
-        field.translatesAutoresizingMaskIntoConstraints = false
-        if identifier == Column.status || identifier == Column.target {
-            field.textColor = .secondaryLabelColor
-        }
-        cell.addSubview(field)
-        cell.textField = field
-        NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
-            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
     }
 
     // MARK: - Context menu
@@ -396,6 +380,43 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
         } else {
             alert.runModal()
         }
+    }
+}
+
+// MARK: - Two-line cell
+
+/// A name over a secondary line, for a row that carries two facts in one
+/// column. `title` doubles as the cell's `textField` so the table treats it
+/// as the row's text.
+@MainActor
+private final class TwoLineCellView: NSTableCellView {
+    let title = NSTextField(labelWithString: "")
+    let subtitle = NSTextField(labelWithString: "")
+
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        subtitle.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        subtitle.textColor = .secondaryLabelColor
+        for field in [title, subtitle] {
+            field.lineBreakMode = .byTruncatingTail
+            field.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(field)
+        }
+        textField = title
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }
 
