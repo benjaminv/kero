@@ -272,6 +272,7 @@ extension TunnelStore {
         assert(parsed[0].forwardSpecification == "127.0.0.1:13389:127.0.0.1:3389")
         assert(parsed[0].listenPort == 13389)
         assert(parsed[1].direction == .remote && parsed[1].localHost == "127.0.0.1")
+        assert(parsed[1].isEnabled)
         assert(parsed[1].localPort == 22 && parsed[1].remotePort == 2222)
         assert(parsed[1].forwardSpecification == "127.0.0.1:2222:127.0.0.1:22")
         assert(parsed[1].listenPort == 2222 && parsed[1].listenAddress == "127.0.0.1:2222")

@@ -60,20 +60,23 @@ final class TunnelSettingsView: NSView, NSTableViewDataSource, NSTableViewDelega
     // MARK: - Layout
 
     private func buildTable() {
-        let columns: [(NSUserInterfaceItemIdentifier, String, CGFloat)] = [
-            (Column.enabled, "", 24),
-            (Column.route, String(localized: "Forward"), 250),
-            (Column.status, String(localized: "Status"), 96),
+        // Only the route column takes the width the pane leaves: the switch
+        // and the status word are fixed. Its minimum has to stay well under
+        // what the pane offers beside them, about 260 pt with the scroller
+        // showing, or the table overflows its clip view and the status
+        // column is cut off instead.
+        let columns: [(NSUserInterfaceItemIdentifier, String, CGFloat, CGFloat)] = [
+            (Column.enabled, "", 24, 24),
+            (Column.route, String(localized: "Forward"), 200, 120),
+            (Column.status, String(localized: "Status"), 96, 96),
         ]
-        for (identifier, title, width) in columns {
+        for (identifier, title, width, minimum) in columns {
             let column = NSTableColumn(identifier: identifier)
             column.title = title
             column.width = width
-            column.minWidth = width
-            // Only the route column takes the width the pane leaves: the
-            // switch and the status word are fixed.
+            column.minWidth = minimum
             column.resizingMask = identifier == Column.route ? .autoresizingMask : []
-            if identifier == Column.enabled { column.maxWidth = 24 }
+            if identifier != Column.route { column.maxWidth = width }
             tableView.addTableColumn(column)
         }
         tableView.dataSource = self
