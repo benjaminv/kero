@@ -1052,6 +1052,10 @@ final class AlacrittyTerminalView: NSView, TerminalBackendSurface, NSUserInterfa
         write(Array(text.utf8))
     }
 
+    func pasteText(_ text: String) {
+        write(AlacrittyKeyMap.paste(text, mode: terminalMode))
+    }
+
     func sendApplicationScroll(lines: Int) -> Bool {
         guard lines != 0 else { return false }
         let mode = terminalMode
@@ -1357,6 +1361,12 @@ final class AlacrittyTerminalView: NSView, TerminalBackendSurface, NSUserInterfa
         // including arrows, Enter, and Escape that select or cancel.
         if hasMarkedText() {
             _ = inputContext?.handleEvent(event)
+            return
+        }
+
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .control,
+           event.charactersIgnoringModifiers == "v",
+           events?.terminalShouldHandleImagePaste() == true {
             return
         }
 
@@ -1718,7 +1728,8 @@ final class AlacrittyTerminalView: NSView, TerminalBackendSurface, NSUserInterfa
             // Image-aware TUIs read the native pasteboard after Ctrl-V. The
             // renderer may not display their image protocol, but the paste
             // itself must still reach the app.
-            if pasteboard.canReadObject(forClasses: [NSImage.self], options: nil) {
+            if pasteboard.canReadObject(forClasses: [NSImage.self], options: nil),
+               events?.terminalShouldHandleImagePaste() != true {
                 write([0x16])
             }
             return

@@ -910,6 +910,23 @@ extension TerminalSession: TerminalBackendEvents {
         find.update(selected: selected)
     }
 
+    func terminalShouldHandleImagePaste() -> Bool {
+        guard let connection = location.remoteConnection,
+              connection.state == .connected,
+              let png = RemoteImagePaste.pngData(from: .general)
+        else { return false }
+        Task { [weak self] in
+            do {
+                let path = try await RemoteImagePaste.upload(png, over: connection)
+                self?.surface.pasteText(path)
+            } catch {
+                NSLog("kero: remote image paste failed: %@", error.localizedDescription)
+                NSSound.beep()
+            }
+        }
+        return true
+    }
+
     func terminalDidRequestClipboardConfirmation(_ request: TerminalClipboardRequest) {
         guard let window = surface.window else {
             request.deny()

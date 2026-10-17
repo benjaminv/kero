@@ -59,6 +59,21 @@ final class KeroTerminalView: AppTerminalView, TerminalBackendSurface {
         super.setSurfaceVisible(visible)
     }
 
+    /// Ghostty's text input is already a paste: it brackets it whenever the
+    /// program enabled bracketed paste.
+    func pasteText(_ text: String) { sendText(text) }
+
+    /// Catches Ctrl-V, and Cmd-V too: on an image-only clipboard the inherited
+    /// `paste(_:)` replays itself as a synthetic Ctrl-V through this method.
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .control,
+           event.charactersIgnoringModifiers == "v",
+           events?.terminalShouldHandleImagePaste() == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
     func clearScreen() {
         performBindingAction("clear_screen")
         // Ask the foreground shell to repaint its prompt at the top.
