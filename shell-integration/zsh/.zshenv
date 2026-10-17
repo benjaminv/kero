@@ -58,6 +58,17 @@ if [[ -o interactive ]] && [[ -n "${KERO_SSH_HELPER-}" ]]; then
       # ssh over itself, so the process id, the terminal and the exit status
       # are the ones ssh would have had anyway.
       "$KERO_SSH_HELPER" "$@"
+      local rc=$?
+      # A dropped connection never lets the remote program undo the modes it
+      # set, so mouse, focus, colour-scheme and kitty keyboard reports would
+      # keep arriving here as typed junk. Reset them and discard what already
+      # queued. /dev/tty, not stdout, so `ssh host cmd | ...` stays clean.
+      if [[ -t 1 ]]; then
+        printf '\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l\e[?1004l\e[?2031l\e[<99u' > /dev/tty
+        local REPLY
+        while read -t 0 -k 1 -s < /dev/tty; do :; done
+      fi
+      return $rc
     }
   }
   autoload -Uz add-zsh-hook
