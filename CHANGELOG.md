@@ -14,6 +14,11 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.48-remote.2]
+
+- Paste images into Claude Code and other image-aware terminal apps running over SSH: Cmd-V or Ctrl-V uploads the copied image to the remote machine and pastes its path
+- Mouse movement no longer types junk into the local shell after an SSH connection drops
+
 ## [0.1.48-remote.1]
 
 - Kero Remote no longer checks for updates or offers upstream Kero releases; the Check for Updates command and the Updates settings are gone from that build
