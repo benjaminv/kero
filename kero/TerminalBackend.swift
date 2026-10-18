@@ -189,6 +189,9 @@ protocol TerminalBackendSurface: NSView {
 
     func sendText(_ text: String)
 
+    /// Delivers `text` as a paste, bracketed when the program asked for it.
+    func pasteText(_ text: String)
+
     /// Sends line-oriented wheel input to the foreground terminal application.
     /// Returns false when the current terminal mode would consume scrolling as
     /// host scrollback instead. Automation uses this only to page a settled
@@ -261,6 +264,11 @@ protocol TerminalBackendEvents: AnyObject {
     func terminalLinkTarget(for value: String) -> TerminalLinkTarget?
     func terminalDidScroll(_ position: TerminalScrollPosition)
     func terminalDidRequestClipboardConfirmation(_ request: TerminalClipboardRequest)
+
+    /// The user pasted (Cmd-V or Ctrl-V). Returns true when the session takes
+    /// the paste over, which it does only for an image-only clipboard in a
+    /// connected remote pane; the surface then sends nothing itself.
+    func terminalShouldHandleImagePaste() -> Bool
 
     /// The backend started a find of its own accord — Kero's ⌘E path resolves
     /// the needle from the grid selection, so the bar learns it from here.
