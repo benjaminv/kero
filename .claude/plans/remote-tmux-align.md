@@ -2,7 +2,10 @@
 
 Repo: benjaminv/kero. Work on the branch `feature/remote-tmux-align`. It was cut from origin/main at 5796007 (0.1.48-remote.2) and holds only this plan. Delete this file in the final commit, because the plan doesn't ship.
 
-Status: parked by Ben on 2026-11-08 until the week of 2026-11-16. Before starting, confirm with Ben: (1) the safe Apply list, (2) whether to check only the connected host, (3) the builder machine.
+Status: parked by Ben on 2026-11-08 until the week of 2026-11-16. Requirements were confirmed by Ben on 2026-11-08:
+1. The safe Apply list below is right.
+2. Kero checks only the host it is connected to.
+3. The builder is the MBA.
 
 Build on a Mac: MBA, since Kero is a personal repo. Test against `ubuntu@oracle`. Read CLAUDE.md first. New UI must be AppKit, never SwiftUI. Keep the repo's comment style ("why" comments).
 
